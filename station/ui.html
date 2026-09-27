@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<!--
+  The station page. Written for a ten-year-old standing next to the arm, and for
+  a projector at the back of the room, which is why the type is large, the colours
+  are high contrast, and there is never more than one obvious thing to press.
+
+  No frameworks and no CDN: the room's wifi is not a dependency this should have.
+-->
+<meta charset="utf-8">
+<title>Robot Station</title>
+<style>
+  :root {
+    --bg: #11141a; --card: #1b1f27; --line: #2c323d;
+    --ink: #f2f5f9; --dim: #98a2b3;
+    --go: #2ea36b; --go-hi: #37c07f;
+    --rec: #d0453f; --rec-hi: #e6564f;
+    --cool: #3b7ddd; --warn: #e2a13a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 17px/1.5 "Segoe UI", system-ui, sans-serif;
+  }
+  header {
+    padding: 18px 26px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap;
+  }
+  h1 { margin: 0; font-size: 28px; letter-spacing: .2px; }
+  .mode {
+    font-size: 15px; font-weight: 700; letter-spacing: .08em;
+    text-transform: uppercase; padding: 5px 12px; border-radius: 999px;
+    background: #262c36; color: var(--dim);
+  }
+  .mode.teleop { background: #17402c; color: var(--go-hi); }
+  .mode.record { background: #43201e; color: var(--rec-hi); }
+  .mode.replay { background: #1e3350; color: #8ab6f0; }
+  main { padding: 22px 26px 40px; max-width: 1180px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 14px; padding: 22px; margin-bottom: 20px;
+  }
+  h2 { margin: 0 0 12px; font-size: 21px; }
+  p { margin: 8px 0; }
+  .dim { color: var(--dim); }
+  button {
+    font: inherit; font-weight: 650; color: #fff; cursor: pointer;
+    background: var(--cool); border: 0; border-radius: 11px;
+    padding: 15px 24px; margin: 6px 8px 6px 0;
+  }
+  button:hover { filter: brightness(1.12); }
+  button:disabled { opacity: .4; cursor: not-allowed; filter: none; }
+  button.big { font-size: 21px; padding: 20px 34px; }
+  button.go { background: var(--go); }
+  button.rec { background: var(--rec); }
+  button.quiet { background: #333b47; }
+  input {
+    font: inherit; color: var(--ink); background: #10131a;
+    border: 1px solid var(--line); border-radius: 9px; padding: 12px 14px;
+  }
+  input[type=text] { width: 100%; max-width: 560px; }
+  input[type=number] { width: 88px; }
+  label { display: inline-block; margin: 8px 18px 8px 0; color: var(--dim); }
+  label span { display: block; color: var(--ink); font-weight: 600; }
+  .cams { display: flex; gap: 16px; flex-wrap: wrap; }
+  figure { margin: 0; }
+  figure img {
+    width: 460px; max-width: 100%; aspect-ratio: 4/3; object-fit: cover;
+    background: #05070a; border-radius: 11px; border: 1px solid var(--line);
+    display: block;
+  }
+  figcaption {
+    margin-top: 7px; font-size: 15px; color: var(--dim);
+    text-transform: uppercase; letter-spacing: .09em;
+  }
+  .bar { height: 15px; background: #10131a; border-radius: 999px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--rec-hi); width: 0; }
+  pre {
+    margin: 0; max-height: 210px; overflow: auto; font-size: 14px;
+    color: var(--dim); background: #10131a; padding: 14px;
+    border-radius: 10px; white-space: pre-wrap;
+  }
+  .countdown { font-size: 76px; font-weight: 800; line-height: 1; margin: 12px 0; }
+  .moved { font-size: 16px; color: var(--dim); font-family: ui-monospace, monospace; }
+  .err {
+    background: #43201e; border: 1px solid #7d3530; color: #ffd9d6;
+    border-radius: 11px; padding: 14px 16px; margin-bottom: 18px;
+  }
+  .hide { display: none !important; }
+</style>
+
+<header>
+  <h1>Robot Station</h1>
+  <span id="mode" class="mode">starting</span>
+  <span id="ports" class="dim"></span>
+</header>
+
+<main>
+  <div id="err" class="err hide"></div>
+
+  <!-- 1. Set-up: only shown until the arms are known -->
+  <section id="setupCard" class="card hide">
+    <h2>Let's find your robot</h2>
+    <p id="setupWhy" class="dim"></p>
+    <div id="setupIdle">
+      <p>Plug both arms into the computer and switch them on. Then press the button.</p>
+      <button class="big go" onclick="startDetect()">Find my robot</button>
+    </div>
+    <div id="setupDrag" class="hide">
+      <p><b>Take hold of the arm you move with your hand and wave it about.</b>
+         Only that one. Keep going until the number reaches zero.</p>
+      <div class="countdown" id="countdown">15</div>
+      <div class="moved" id="moved"></div>
+    </div>
+  </section>
+
+  <!-- 2. Cameras -->
+  <section id="camCard" class="card hide">
+    <h2>What the robot sees</h2>
+    <div class="cams" id="cams"></div>
+    <p class="dim" id="camNote"></p>
+    <button class="quiet" id="swapBtn" onclick="post('/api/cameras/swap')">
+      Swap front and wrist
+    </button>
+  </section>
+
+  <!-- 3. Drive it -->
+  <section id="driveCard" class="card hide">
+    <h2>Move the robot</h2>
+    <p class="dim">The arm you hold is the <b>leader</b>. The other one copies it.</p>
+    <button class="big go" id="teleopBtn" onclick="post('/api/teleop/start')">
+      Start moving
+    </button>
+    <button class="big quiet" id="stopBtn" onclick="post('/api/stop')">Stop</button>
+    <p class="dim" id="teleopFps"></p>
+  </section>
+
+
+
+  <!-- 4. Record -->
+  <section id="recCard" class="card hide">
+    <h2>Teach the robot a job</h2>
+    <p class="dim">Do the job with the leader arm. The robot writes down everything
+       it sees and everything you do. Everything stays on this computer.</p>
+    <p><label style="display:block"><span>What is the job?</span>
+      <input type="text" id="task" placeholder="Pick up the red block and put it in the cup">
+    </label></p>
+    <p class="dim">One try at a time, for as long as it takes. There is no timer.
+       Press <b>Done</b> when the job is finished. Press <b>Start recording</b>
+       again for another try and it is added to the same job.</p>
+    <p><label style="display:block"><span>Save the recordings in this folder</span>
+      <input type="text" id="dsdir" oninput="dirTouched=true"
+             placeholder="leave empty for the default folder">
+    </label>
+      <button class="quiet" onclick="setDir()">Use this folder</button>
+      <span class="dim" id="dsdirNow"></span>
+    </p>
+    <p>
+      <button class="big rec" id="recBtn" onclick="startRecord()">Start recording</button>
+    </p>
+    <div id="recLive" class="hide">
+      <p><b id="recCount">Recording. Do the job now.</b></p>
+      <p>
+        <button class="big go" onclick="post('/api/record/next')">Done, save this try</button>
+        <button class="quiet" onclick="post('/api/record/redo')">That went wrong, do it again</button>
+        <button class="rec" onclick="post('/api/stop')">Throw it away and stop</button>
+      </p>
+    </div>
+  </section>
+
+  <!-- 5. Replay -->
+  <section id="replayCard" class="card hide">
+    <h2>Watch it again</h2>
+    <p class="dim">Plays a recording back on the arm by itself. Nobody holds the
+       leader. <b>Keep hands and faces clear before you press it.</b></p>
+    <p>
+      <label><span>Which recording</span>
+        <select id="dsPick" onchange="fillEpisodes()"></select></label>
+      <label><span>Which try</span><input type="number" id="dsEp" value="0" min="0"></label>
+    </p>
+    <button class="big" id="replayBtn" onclick="startReplay()">Play it back</button>
+    <p class="dim" id="replayNote"></p>
+  </section>
+
+  <!-- Stuck arm: the motors hold position, so pulling does nothing until told -->
+  <section id="helpCard" class="card hide">
+    <h2>Is an arm stuck?</h2>
+    <p class="dim">If an arm will not move when you pull it, its motors are still
+       holding on. Switching them off lets go.
+       <b>Hold the arm first -- it goes floppy and will drop.</b></p>
+    <button class="quiet" id="releaseBtn" onclick="releaseMotors()">
+      Switch the motors off
+    </button>
+  </section>
+
+  <section class="card">
+    <h2>What just happened</h2>
+    <pre id="log"></pre>
+  </section>
+</main>
+
+<script>
+let state = null;
+let dragging = false;
+let streamsFor = "";
+let datasetsKey = "";
+let dirTouched = false;
+
+const $ = id => document.getElementById(id);
+const busyNow = s => s.mode !== "idle";
+// Must match the slug built in hardware.py, so the page can find the job's folder.
+const slug = t => t.toLowerCase().replace(/[^a-z0-9]/g, "_").replace(/^_+|_+$/g, "").slice(0, 40);
+
+async function post(path, body) {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body || {})
+  });
+  const out = await r.json();
+  if (out && out.ok === false && out.why) alert(out.why);
+  refresh();
+  return out;
+}
+
+async function startDetect() {
+  const out = await post("/api/detect/start");
+  if (out.ok) { dragging = true; pollDetect(); }
+}
+
+async function pollDetect() {
+  if (!dragging) return;
+  const out = await post("/api/detect/poll");
+  if (out.stage === "dragging") {
+    $("countdown").textContent = Math.ceil(out.remaining);
+    $("moved").textContent = Object.entries(out.moved || {})
+      .map(([p, v]) => p + " moved " + v).join("   ");
+    setTimeout(pollDetect, 250);
+  } else {
+    dragging = false;
+    if (out.stage === "failed") alert(out.why);
+  }
+}
+
+function setDir() { post("/api/datasets/dir", {path: $("dsdir").value}); }
+
+function fillEpisodes() {
+  const d = (state.datasets || []).find(x => x.name === $("dsPick").value);
+  const n = d ? d.episodes : 0;
+  $("dsEp").max = Math.max(0, n - 1);
+  $("replayNote").textContent = d
+    ? `${d.name} has ${n} ${n === 1 ? "try" : "tries"}, numbered 0 to ${Math.max(0, n - 1)}.`
+    : "";
+}
+
+function startReplay() {
+  const name = $("dsPick").value;
+  if (!name) { alert("Record something first."); return; }
+  if (!confirm("The arm will move on its own. Is everyone clear of it?")) return;
+  post("/api/replay/start", {name: name, episode: +$("dsEp").value});
+}
+
+function buildDatasets(list) {
+  const key = list.map(d => d.name + ":" + d.episodes).join("|");
+  if (key === datasetsKey) return;         // leave the dropdown alone while it is in use
+  datasetsKey = key;
+  const keep = $("dsPick").value;
+  $("dsPick").innerHTML = list.map(d =>
+    `<option value="${d.name}">${d.name} (${d.episodes})</option>`).join("");
+  if (list.some(d => d.name === keep)) $("dsPick").value = keep;
+  fillEpisodes();
+}
+
+function releaseMotors() {
+  if (!confirm("Hold the arm first -- it will go floppy and drop. Ready?")) return;
+  post("/api/release");
+}
+
+function startRecord() { post("/api/record/start", {task: $("task").value}); }
+
+function buildCams(names) {
+  const key = names.join(",");
+  if (key === streamsFor) return;          // never rebuild a live <img>, it restarts the stream
+  streamsFor = key;
+  $("cams").innerHTML = names.map(n =>
+    `<figure><img src="/stream/${n}" alt="${n} camera"><figcaption>${n}</figcaption></figure>`
+  ).join("");
+}
+
+async function refresh() {
+  let s;
+  try { s = await (await fetch("/api/state")).json(); }
+  catch { return; }                        // server shutting down; the page can wait
+  state = s;
+
+  $("mode").textContent = s.mode === "idle" ? "ready" : s.mode;
+  $("mode").className = "mode " + s.mode;
+
+  const c = s.config || {};
+  $("ports").textContent = c.leader_port
+    ? `leader ${c.leader_port} - follower ${c.follower_port}` : "";
+
+  $("err").classList.toggle("hide", !s.error);
+  if (s.error) $("err").textContent = s.error;
+
+  const ready = s.config_ok;
+  $("setupCard").classList.toggle("hide", ready && s.setup_stage !== "dragging");
+  $("setupWhy").textContent = ready ? "" : (s.config_why || "");
+  $("setupIdle").classList.toggle("hide", dragging);
+  $("setupDrag").classList.toggle("hide", !dragging);
+
+  $("camCard").classList.toggle("hide", !ready || !s.cameras.length);
+  $("driveCard").classList.toggle("hide", !ready);
+  $("recCard").classList.toggle("hide", !ready);
+  $("replayCard").classList.toggle("hide", !ready);
+  $("helpCard").classList.toggle("hide", !ready);
+  $("dsdirNow").textContent = "now: " + (s.datasets_dir || "");
+  if (!dirTouched && document.activeElement !== $("dsdir")) $("dsdir").value = s.datasets_dir || "";
+  buildDatasets(s.datasets || []);
+  $("releaseBtn").disabled = busyNow(s);
+
+  if (ready && s.cameras.length) {
+    buildCams(s.cameras);
+    $("swapBtn").classList.toggle("hide", s.cameras.length < 2);
+    $("camNote").textContent = s.cameras.length < 2
+      ? "Only one camera found. That is fine, the arm still works."
+      : "If these two are the wrong way round, press the button.";
+  }
+
+  const busy = s.mode !== "idle";
+  $("teleopBtn").disabled = busy;
+  $("recBtn").disabled = busy;
+  $("replayBtn").disabled = busy || !(s.datasets || []).length;
+  $("stopBtn").disabled = !busy;
+  $("teleopFps").textContent =
+    s.mode === "teleop" ? `running at ${s.status.fps} steps a second` : "";
+
+  const rec = s.mode === "record";
+  $("recLive").classList.toggle("hide", !rec);
+  if (rec) {
+    const job = (s.datasets || []).find(d => "nexarm_" + slug($("task").value) === d.name);
+    const have = job ? job.episodes : 0;
+    $("recCount").textContent = have
+      ? `Recording. This job already has ${have} saved ${have === 1 ? "try" : "tries"}.`
+      : "Recording. Do the job now, then press Done.";
+  }
+
+  $("log").textContent = (s.log || []).join("\n");
+  $("log").scrollTop = $("log").scrollHeight;
+}
+
+refresh();
+setInterval(refresh, 700);
+</script>
