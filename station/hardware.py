@@ -136,6 +136,7 @@ class Station:
         # A question for the person at the page -- LeRobot's calibration asks
         # them -- and the Next button that answers it.
         self.prompt: str | None = None
+        self._prompt_since = 0.0
         self._next = threading.Event()
         self._cancel = threading.Event()
         self._calibrating = ""
@@ -584,9 +585,15 @@ class Station:
         no keyboard here, only a page, so both are pointed at the page's Next
         button for as long as the arms are connecting. A NexArm never asks.
         """
-        from lerobot.motors import motors_bus
+        import sys
 
-        real_input, real_enter = builtins.input, motors_bus.enter_pressed
+        real_input = builtins.input
+        # Every motor bus module that polls the keyboard holds its own reference
+        # to enter_pressed: the shared MotorsBus, and a few buses (Damiao,
+        # Robstride) that carry their own copy of the range-recording loop.
+        enter_owners = [m for name, m in list(sys.modules.items())
+                        if name.startswith("lerobot.motors") and hasattr(m, "enter_pressed")]
+        real_enters = [(m, m.enter_pressed) for m in enter_owners]
         station = self
 
         def page_input(prompt=""):
@@ -600,24 +607,36 @@ class Station:
 
         def page_enter():
             if station.prompt is None:
-                station.prompt = robots.ranges_prompt(station._calibrating)
-                station.say(station.prompt)
+                station._set_prompt(robots.ranges_prompt(station._calibrating))
             return station._take_next()
 
         builtins.input = page_input
-        motors_bus.enter_pressed = page_enter
+        for m, _ in real_enters:
+            m.enter_pressed = page_enter
         try:
             yield
         finally:
             builtins.input = real_input
-            motors_bus.enter_pressed = real_enter
+            for m, fn in real_enters:
+                m.enter_pressed = fn
             self.prompt = None
+
+    # A Next that arrives sooner than this after a question appeared is ignored.
+    # Children double-click, and the second click of a double-click on "put every
+    # joint halfway" landed on the next question, "move every joint to both
+    # ends", and ended it before anything had moved -- which LeRobot rejects with
+    # "Some motors have the same min and max values", failing the calibration.
+    NEXT_DEBOUNCE_S = 1.0
+
+    def _set_prompt(self, text: str) -> None:
+        self._next.clear()
+        self._prompt_since = time.monotonic()
+        self.prompt = text
+        self.say(text)
 
     def _ask(self, text: str) -> None:
         """Show a question and wait for Next. Stop cancels the wait."""
-        self._next.clear()
-        self.prompt = text
-        self.say(text)
+        self._set_prompt(text)
         while not self._next.wait(0.2):
             if self._cancel.is_set():
                 self.prompt = None
@@ -636,8 +655,11 @@ class Station:
         return False
 
     def prompt_next(self) -> dict:
+        """The page's Next button. Never an error to press it: at worst it is ignored."""
         if self.prompt is None:
-            return {"ok": False, "why": "nothing is waiting for Next"}
+            return {"ok": True, "ignored": "nothing is waiting for Next"}
+        if time.monotonic() - self._prompt_since < self.NEXT_DEBOUNCE_S:
+            return {"ok": True, "ignored": "too soon after the question appeared"}
         self._next.set()
         return {"ok": True}
 
@@ -1079,13 +1101,15 @@ class Station:
             if self.mode != "idle":
                 return {"ok": False, "why": "press Stop first"}
             kind = self.kind or robots.NEXARM
-            ports = [p for p in (self.cfg.get("leader_port"), self.cfg.get("follower_port")) if p]
-            if not ports:
+            roles = [(self.cfg.get(f"{r}_port"), r) for r in ("leader", "follower")]
+            roles = [(p, r) for p, r in roles if p]
+            if not roles:
                 # Nothing set up yet: the only arms that can be released blind
                 # are NexArms, which is what this did before there was a choice.
-                kind, ports = robots.NEXARM, detect.candidate_ports()
+                kind = robots.NEXARM
+                roles = [(p, "follower") for p in detect.candidate_ports()]
             self.close_cameras()
-            done = [p for p in ports if robots.release(kind, p)]
+            done = [p for p, r in roles if robots.release(kind, p, r)]
             for p in done:
                 self.say(f"{p}: motors off, that arm moves by hand now")
             if not done:

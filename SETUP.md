@@ -302,7 +302,7 @@ The station picks 8124 or 8125 instead. The URL it prints is the right one.
 python station/selftest.py
 ```
 
-134 checks: detection of every kind of arm, the page, the API, camera streams, the jump guard, the
+142 checks: detection of every kind of arm, the page, the API, camera streams, the jump guard, the
 railed-reading guard, the save folder, the replay guards, zero/one/two cameras,
 cross-platform behaviour, and that recordings are not set to upload. It never
 moves an arm.
@@ -342,6 +342,6 @@ the flag yourself.
 | `station/server.py` | Local web server, JSON API, MJPEG camera streams. |
 | `station/ui.html` | The page. No frameworks, no CDN. |
 | `station/release.py` | Switches the motors off. |
-| `station/selftest.py` | The 134 checks. |
+| `station/selftest.py` | The 142 checks. |
 | `nexarm.json` | Which port is which arm, which camera is which. Machine-specific, not committed. |
 | `datasets/` | Your recordings. Not committed. |

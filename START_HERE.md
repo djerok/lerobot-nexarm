@@ -116,7 +116,7 @@ do the fifteen-second wave again. Nothing is broken.
 python station/selftest.py
 ```
 
-Runs 134 checks: detection of every kind of arm, the page, the API, the camera streams, the speed limit,
+Runs 142 checks: detection of every kind of arm, the page, the API, the camera streams, the speed limit,
 the railed-reading guard, and that recordings are not set to upload. It needs the
 cameras but never moves an arm.
 

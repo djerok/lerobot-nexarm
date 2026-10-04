@@ -42,6 +42,12 @@ U2D2 = (0x0403, 0x6014)
 DRAG_FLOOR = 100
 DRAG_RATIO = 3
 
+# How long to wait for one motor to answer while finding out what is on a port.
+# LeRobot's own default is a full second per motor, so asking an Arduino or a
+# GPS dongle "are you a six-motor arm?" took six seconds per kind of arm -- the
+# page froze for twenty. A real motor answers in a couple of milliseconds.
+PROBE_TIMEOUT_MS = 100
+
 
 class Cancelled(Exception):
     """Stop was pressed while the station was waiting on a person."""
@@ -306,36 +312,71 @@ class NexArmReader:
             pass
 
 
+def _role_bus(kind: Kind, port: str, role: str):
+    """The motor bus of the leader's or the follower's class. Builds, never connects."""
+    device = make_leader(kind, port, "station_probe") if role == "leader" \
+        else make_follower(kind, port, "station_probe")
+    return device.bus
+
+
+def _answers_as(bus) -> bool:
+    """Every motor this bus expects answers with the expected model. Read-only.
+
+    The same check as LeRobot's handshake, but with a short timeout, because
+    the handshake waits a full second for each motor that does not answer.
+    """
+    try:
+        bus.set_timeout(PROBE_TIMEOUT_MS)
+        for motor in bus.motors.values():
+            if bus.ping(motor.id) != bus.model_number_table.get(motor.model):
+                return False
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            bus.set_timeout()
+        except Exception:
+            pass
+
+
 class LeRobotReader:
     """Raw positions through a kind's own LeRobot bus, touching nothing else.
 
-    The leader's class is used on both ports on purpose. Building it does not
-    talk to the motors, and only ``bus.connect`` runs here -- never ``connect()``
-    on the device, which would start a calibration, and never ``configure()``,
-    which on a follower switches the torque on. The handshake pings every motor
-    the kind should have, which is what makes this a real identification and not
-    a guess from the USB chip.
+    Only ``bus.connect`` runs here -- never ``connect()`` on the device, which
+    would start a calibration, and never ``configure()``, which on a follower
+    switches the torque on. Every motor the arm should have is pinged and its
+    model checked, which makes this a real identification and not a guess from
+    the USB chip.
+
+    The leader's motor list is tried first and then the follower's. They are
+    the same for an SO arm, but not for every kind: a Koch leader has xl330-m077
+    motors where its follower has xl430s, and an OpenManipulator-X follower
+    numbers its motors 11-16 where the leader uses 1-6. Checking a follower port
+    against the leader's list alone found no follower at all.
     """
 
-    def __init__(self, bus):
+    def __init__(self, bus, role: str):
         self.bus = bus
+        self.role = role        # which motor list the port answered to
 
     @classmethod
     def open(cls, kind: Kind, port: str):
-        bus = make_leader(kind, port, "station_probe").bus
-        try:
-            bus.connect(handshake=True)
-        except Exception:
+        for role in ("leader", "follower"):
+            bus = _role_bus(kind, port, role)
+            try:
+                bus.connect(handshake=False)
+            except Exception:
+                return None             # the port itself would not open
+            if _answers_as(bus):
+                reader = cls(bus, role)
+                if reader.read() is not None:
+                    return reader
             try:
                 bus.disconnect(disable_torque=False)
             except Exception:
                 pass
-            return None
-        reader = cls(bus)
-        if reader.read() is None:
-            reader.close()
-            return None
-        return reader
+        return None
 
     def read(self):
         try:
@@ -418,6 +459,16 @@ class ArmFinder:
             else:
                 log(f"  {p.device}: no arm answering")
 
+        # Clone USB adapters sometimes all carry the same serial number. A serial
+        # that is not unique cannot tell two arms apart, so it is not kept.
+        counts: dict[str, int] = {}
+        for serial in self.serials.values():
+            if serial:
+                counts[serial] = counts.get(serial, 0) + 1
+        for p, serial in self.serials.items():
+            if serial and counts[serial] > 1:
+                self.serials[p] = ""
+
         pairs = [k for k in found if len(found[k]) >= 2]
         choice = pairs[0] if pairs else max(found, key=lambda k: len(found[k]), default=None)
         if len(pairs) > 1:
@@ -462,22 +513,37 @@ class ArmFinder:
         self.arms.clear()
 
 
-def release(kind: Kind, port: str) -> bool:
-    """Switch one arm's motors off so it can be moved by hand."""
+def release(kind: Kind, port: str, role: str = "follower") -> bool:
+    """Switch one arm's motors off so it can be moved by hand.
+
+    Uses the motor list of the arm's own role first: an OpenManipulator-X
+    follower's motors are 11-16, and switching off 1-6 instead would have
+    reported success while the stuck arm stayed stuck. Success means the motors
+    were found and told -- not merely that the port opened.
+    """
     if kind.raw_counts:
         from station import release as rel
 
         return rel.release(port)
-    try:
-        bus = make_leader(kind, port, "station_probe").bus
-        bus.connect(handshake=False)
+    other = "leader" if role == "follower" else "follower"
+    for which in (role, other):
         try:
-            bus.disable_torque()
+            bus = _role_bus(kind, port, which)
+            bus.connect(handshake=False)
+        except Exception:
+            return False
+        try:
+            if _answers_as(bus):
+                bus.disable_torque()
+                return True
+        except Exception:
+            pass
         finally:
-            bus.disconnect(disable_torque=False)
-        return True
-    except Exception:
-        return False
+            try:
+                bus.disconnect(disable_torque=False)
+            except Exception:
+                pass
+    return False
 
 
 def park_goal(bus) -> None:

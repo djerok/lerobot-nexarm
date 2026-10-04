@@ -159,7 +159,11 @@ def remap_by_serial(cfg: dict) -> bool:
     has one, the NexArm's CH340 does not -- the port is looked up again instead of
     sending a child back to the wave test. Returns True if anything changed.
     """
-    serials = {p.serial_number: p.device for p in usb_serial_ports() if p.serial_number}
+    serials: dict[str, str | None] = {}
+    for p in usb_serial_ports():
+        if p.serial_number:
+            # A serial shared by two adapters (clone boards) points nowhere.
+            serials[p.serial_number] = None if p.serial_number in serials else p.device
     changed = False
     for role in ("leader", "follower"):
         serial = cfg.get(f"{role}_serial")

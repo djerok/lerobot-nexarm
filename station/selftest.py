@@ -175,6 +175,10 @@ def main() -> int:
         check("swapping twice is a round trip", st.cfg["cameras"] == before)
 
     print("\n4. web server")
+    # start.py loads LeRobot's list of arms before it serves the page; do the
+    # same here, or the first /api/state pays those seconds and times out.
+    from station import robots as _robots
+    _robots.choices()
     port = server.free_port(8199)
     httpd = server.serve(st, port)
     base = f"http://127.0.0.1:{port}"
@@ -191,8 +195,8 @@ def main() -> int:
         check("/api/state offers more than one kind of arm",
               len(state["robots"]) >= 2, str([r["key"] for r in state["robots"]]))
         r = post(base + "/api/prompt/next")
-        check("Next with nothing waiting is refused, not an error", r.get("ok") is False,
-              r.get("why", ""))
+        check("Next with nothing waiting is ignored, never an error popup",
+              r.get("ok") is True and bool(r.get("ignored")), r.get("ignored", ""))
         check("/api/state reports idle", state["mode"] == "idle")
         if names and not busy and not no_cams:
             code, ctype, body = get(f"{base}/shot/{names[0]}.jpg")
@@ -549,6 +553,98 @@ def any_kind_of_arm(st_cfg: dict) -> None:
     finally:
         robots.detect.usb_serial_ports, robots.open_reader = real_ports, real_open
 
+    # -- reading a port with the right motor list: leader's, then follower's
+    import types
+
+    class _Bus:
+        """A stand-in LeRobot motor bus whose motors answer as `answers` says."""
+        def __init__(self, motors, answers):
+            self.motors = {f"m{i}": types.SimpleNamespace(id=i, model=model)
+                           for i, model in motors.items()}
+            self.model_number_table = {"xl330-m077": 1190, "xl330-m288": 1200,
+                                       "xl430-w250": 1060, "sts3215": 777}
+            self.answers, self.timeouts, self.released = answers, [], False
+            self.pings = 0
+
+        def connect(self, handshake=True):
+            pass
+
+        def disconnect(self, disable_torque=True):
+            pass
+
+        def set_timeout(self, timeout_ms=None):
+            self.timeouts.append(timeout_ms)
+
+        def ping(self, motor_id, num_retry=0, raise_on_error=False):
+            self.pings += 1
+            return self.answers.get(motor_id)
+
+        def sync_read(self, name, motors=None, normalize=True, num_retry=0):
+            return {m: 2048 for m in self.motors}
+
+        def disable_torque(self, motors=None, num_retry=0):
+            self.released = True
+
+    koch = robots.by_key("koch")
+    omx = robots.by_key("omx")
+    koch_follower_motors = {1: 1060, 2: 1060, 3: 1200, 4: 1200, 5: 1200, 6: 1200}
+    leader_list = {i: "xl330-m077" for i in range(1, 7)}
+    follower_list = {1: "xl430-w250", 2: "xl430-w250", 3: "xl330-m288",
+                     4: "xl330-m288", 5: "xl330-m288", 6: "xl330-m288"}
+    made = []
+
+    def fake_role_bus(kind, port, role):
+        bus = _Bus(leader_list if role == "leader" else follower_list, koch_follower_motors)
+        made.append((role, bus))
+        return bus
+
+    real_role_bus = robots._role_bus
+    try:
+        robots._role_bus = fake_role_bus
+        reader = robots.LeRobotReader.open(koch, "COM5")
+        check("a Koch FOLLOWER port is recognised (its motors are not the leader's)",
+              reader is not None and reader.role == "follower",
+              f"tried {[r for r, _ in made]}")
+        check("probing waits 100 ms a motor, not LeRobot's full second",
+              all(b.timeouts and b.timeouts[0] == robots.PROBE_TIMEOUT_MS for _, b in made),
+              str([b.timeouts for _, b in made]))
+        made.clear()
+        check("switching off a follower uses the follower's motor list",
+              robots.release(koch, "COM5", "follower") and made[0][0] == "follower"
+              and made[0][1].released)
+        koch_follower_motors.clear()            # nothing answers on this port now
+        made.clear()
+        check("switching off reports failure when no motor answers",
+              robots.release(koch, "COM5", "follower") is False
+              and not any(b.released for _, b in made))
+    finally:
+        robots._role_bus = real_role_bus
+    check("an OpenManipulator-X follower numbers its motors 11-16",
+          sorted(m.id for m in robots.make_follower(omx, "COM98", "x").bus.motors.values())
+          == list(range(11, 17)))
+
+    # -- clone adapters that share a serial number
+    real_ports = robots.detect.usb_serial_ports
+    try:
+        twins = [_Port("COM8", 0x1A86, 0x55D3, "CH343", "0001"),
+                 _Port("COM10", 0x1A86, 0x55D3, "CH343", "0001")]
+        robots.detect.usb_serial_ports = lambda: twins
+        cfg_twins = {"leader_serial": "0001", "leader_port": "COM30",
+                     "follower_serial": "0001", "follower_port": "COM31"}
+        check("a serial number shared by two adapters is never followed",
+              detect.remap_by_serial(cfg_twins) is False
+              and cfg_twins["leader_port"] == "COM30")
+        real_open2 = robots.open_reader
+        robots.open_reader = lambda kind, port, log=print: _Reader([2000] * 6) \
+            if kind.key == "so101" else None
+        twin_finder = robots.ArmFinder()
+        twin_finder.open_all(log=lambda m: None)
+        check("...and is not saved as an arm's identity",
+              twin_finder.serials == {"COM8": "", "COM10": ""}, str(twin_finder.serials))
+        robots.open_reader = real_open2
+    finally:
+        robots.detect.usb_serial_ports = real_ports
+
     # -- a moved cable is followed by serial number
     real_comports = list_ports.comports
     try:
@@ -678,12 +774,20 @@ def any_kind_of_arm(st_cfg: dict) -> None:
     check("'move to the middle' reaches the page, in words for a child",
           bool(cal.prompt) and "halfway" in cal.prompt and "arm you hold" in cal.prompt,
           (cal.prompt or "")[:70])
+    first = cal.prompt
+    early = cal.prompt_next()
+    check("a Next straight after a question appears is ignored",
+          bool(early.get("ignored")) and cal.prompt == first, str(early))
+    time.sleep(cal.NEXT_DEBOUNCE_S + 0.1)
     cal.prompt_next()
+    cal.prompt_next()              # the second click of a double-click
     deadline = time.time() + 3
     while time.time() < deadline and not (cal.prompt and "both ends" in cal.prompt):
         time.sleep(0.02)
-    check("the sweep through every joint is asked for next",
-          bool(cal.prompt) and "both ends" in cal.prompt, (cal.prompt or "")[:70])
+    check("a double-click does not skip the sweep through every joint",
+          bool(cal.prompt) and "both ends" in cal.prompt and not done.is_set(),
+          (cal.prompt or "")[:70])
+    time.sleep(cal.NEXT_DEBOUNCE_S + 0.1)
     cal.prompt_next()
     check("Next ends the sweep", done.wait(3) and not errors, str(errors))
     check("the terminal prompt is put back afterwards",
