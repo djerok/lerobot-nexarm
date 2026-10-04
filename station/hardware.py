@@ -19,18 +19,26 @@ dataset layout is not something worth having a second, subtly different copy of.
 Two small patches make that possible: ``init_keyboard_listener`` is replaced so
 the browser's buttons become the Enter / redo / stop keys, and the follower's
 ``get_observation`` is wrapped so frames can be teed to the browser.
+
+Which arm it is comes from robots.py. A NexArm runs exactly the path it always
+did; any other arm goes through LeRobot's own classes, and the first time one is
+used on a computer LeRobot's calibration runs with its terminal prompts turned
+into a Next button on the page.
 """
 
 from __future__ import annotations
 
+import builtins
+import contextlib
 import json
+import math
 import threading
 import time
 import traceback
 from collections import deque
 from pathlib import Path
 
-from . import detect
+from . import detect, robots
 
 ROOT = Path(__file__).resolve().parent.parent
 DATASETS_DIR = ROOT / "datasets"
@@ -110,7 +118,7 @@ class Station:
         self.error: str | None = None
 
         # Set-up wizard state.
-        self.arm_session: detect.ArmSession | None = None
+        self.arm_session: robots.ArmFinder | None = None
         self.setup_stage = "unknown"   # unknown | need_arms | dragging | ready
         self.drag_deadline: float = 0.0
         self.cameras_found: list[int] = []
@@ -120,6 +128,25 @@ class Station:
 
         # Last target sent to each joint, for the per-tick travel limit.
         self._last_sent: dict[str, float] = {}
+
+        # Per-joint safety numbers for a LeRobot arm. None means NexArm, whose
+        # numbers are the module constants above.
+        self._limits: dict[str, robots.Limits] | None = None
+
+        # A question for the person at the page -- LeRobot's calibration asks
+        # them -- and the Next button that answers it.
+        self.prompt: str | None = None
+        self._next = threading.Event()
+        self._cancel = threading.Event()
+        self._calibrating = ""
+
+    @property
+    def kind(self) -> robots.Kind | None:
+        """The kind of arm the saved setup is for.
+
+        Setups saved before there was a choice were all NexArm, and say so.
+        """
+        return robots.by_key(self.cfg.get("robot_type") or "nexarm")
 
     # ---------------------------------------------------------------- logging
 
@@ -190,28 +217,45 @@ class Station:
     # ----------------------------------------------------------------- config
 
     def load(self) -> tuple[bool, str]:
-        cfg = detect.load_config()
-        ok, why = detect.config_is_usable(cfg)
-        if ok:
-            self.cfg = cfg
-            self.setup_stage = "ready"
-        else:
-            self.cfg = cfg or {}
-            self.setup_stage = "need_arms"
+        self.cfg = detect.load_config() or {}
+        ok, why = self.usable()
+        self.setup_stage = "ready" if ok else "need_arms"
         self.say(why)
+        return ok, why
+
+    def usable(self) -> tuple[bool, str]:
+        """Is the saved setup still true of what is plugged in?
+
+        An arm whose USB adapter has a serial number is followed to its new port
+        first, so moving a cable does not mean doing the wave test again.
+        """
+        if detect.remap_by_serial(self.cfg):
+            detect.save_config(self.cfg)
+            self.say(f"Found the arms again on {self.cfg.get('leader_port')} and "
+                     f"{self.cfg.get('follower_port')}.")
+        ok, why = detect.config_is_usable(self.cfg)
+        if ok and self.kind is None:
+            return False, (f"this computer does not know the robot type "
+                           f"{self.cfg.get('robot_type')!r} -- find the robot again")
         return ok, why
 
     # ------------------------------------------------------------ set-up flow
 
-    def begin_arm_detect(self) -> dict:
-        """Open every candidate port, then start the drag window."""
+    def begin_arm_detect(self, kind: str | None = None) -> dict:
+        """Open every candidate port, then start the drag window.
+
+        ``kind`` is set when someone picked the robot on the page instead of
+        leaving it to be recognised.
+        """
         with self.lock:
             if self.mode != "idle":
                 return {"ok": False, "why": "stop what is running first"}
+            if kind and robots.by_key(kind) is None:
+                return {"ok": False, "why": f"unknown robot type {kind!r}"}
             self.close_cameras()
             if self.arm_session:
                 self.arm_session.close()
-            self.arm_session = detect.ArmSession()
+            self.arm_session = robots.ArmFinder(force=kind or None)
             ports = self.arm_session.open_all(log=self.say)
             if len(ports) < 2:
                 self.arm_session.close()
@@ -225,8 +269,10 @@ class Station:
                 }
             self.setup_stage = "dragging"
             self.drag_deadline = time.monotonic() + 15.0
-            self.say("Drag test: wave the arm you hold in your hand.")
-            return {"ok": True, "ports": ports, "seconds": 15}
+            self.say(f"Found two {self.arm_session.kind.label} arms. "
+                     f"Drag test: wave the arm you hold in your hand.")
+            return {"ok": True, "ports": ports, "seconds": 15,
+                    "robot": self.arm_session.kind.label}
 
     def poll_arm_detect(self) -> dict:
         """Called repeatedly by the page while the child waves an arm."""
@@ -239,6 +285,7 @@ class Station:
                 return {"stage": "dragging", "moved": moved, "remaining": round(remaining, 1)}
 
             leader, follower = self.arm_session.verdict()
+            kind, serials = self.arm_session.kind, dict(self.arm_session.serials)
             self.arm_session.close()
             self.arm_session = None
 
@@ -252,14 +299,19 @@ class Station:
                            "powered -- switch it off and on, then try again.",
                 }
 
+            # A new kind of arm means none of the old kind's names apply.
+            for stale in ("baudrate", "leader_id", "follower_id",
+                          "leader_serial", "follower_serial"):
+                self.cfg.pop(stale, None)
             self.cfg.update({
-                "robot_type": "nexarm",
+                "robot_type": kind.key,
                 "leader_port": leader,
                 "follower_port": follower,
-                "baudrate": detect.BAUD,
                 "fps": self.cfg.get("fps", 30),
+                **({"baudrate": detect.BAUD} if kind.raw_counts else {}),
+                **robots.arm_ids(kind, leader, follower, serials),
             })
-            self.say(f"leader {leader}, follower {follower}")
+            self.say(f"{kind.label}: leader {leader}, follower {follower}")
 
             self.say("Looking for cameras.")
             self.cameras_found = detect.probe_cameras(log=self.say)
@@ -394,32 +446,35 @@ class Station:
         with self.lock:
             if self.mode != "idle":
                 return {"ok": False, "why": f"already {self.mode}"}
-            ok, why = detect.config_is_usable(self.cfg)
+            ok, why = self.usable()
             if not ok:
                 return {"ok": False, "why": why}
             self.error = None
             self.mode = "teleop"
             self._last_sent = {}
             self._stop.clear()
+            self._cancel.clear()
             threading.Thread(target=self._teleop_worker, name="teleop", daemon=True).start()
             return {"ok": True}
 
     def _teleop_worker(self) -> None:
-        from lerobot.robots.nexarm_follower import NexArmFollower, NexArmFollowerConfig
-        from lerobot.teleoperators.nexarm_leader import NexArmLeader, NexArmLeaderConfig
         from lerobot.utils.robot_utils import precise_sleep
 
         fps = int(self.cfg.get("fps", 30))
         follower = leader = None
-        real_configure = self._park_goal_before_torque(NexArmFollower)
+        follower_cls = real_configure = None
         try:
             # Cameras stay with the station here, so the robot is built with none.
-            follower = NexArmFollower(NexArmFollowerConfig(
-                port=self.cfg["follower_port"], cameras={},
-                motion_acc=MOTION_ACC, motion_speed=MOTION_SPEED))
-            leader = NexArmLeader(NexArmLeaderConfig(port=self.cfg["leader_port"]))
-            follower.connect()
-            leader.connect()
+            follower = self._make_follower(cameras={})
+            leader = self._make_leader()
+            follower_cls = type(follower)
+            real_configure = self._park_goal_before_torque(follower_cls)
+            self._limits = self._limits_for(follower)
+            with self._page_prompts():
+                self._calibrating = robots.which_arm("follower")
+                follower.connect()
+                self._calibrating = robots.which_arm("leader")
+                leader.connect()
             self.say("Arms connected. Easing the follower over to match the leader.")
             if not self._first_sync(follower, leader, fps):
                 self.say("Not moving: the arms are not reporting sane positions yet. "
@@ -431,19 +486,22 @@ class Station:
             while not self._stop.is_set():
                 start = time.perf_counter()
                 action = leader.get_action()
-                if reading_is_sane(action.values()):
+                if self._sane(action):
                     follower.send_action(self._rate_limit(action))
                 ticks += 1
                 if start - t_window >= 1.0:
                     self.status["fps"] = round(ticks / (start - t_window), 1)
                     ticks, t_window = 0, start
                 precise_sleep(1.0 / fps - (time.perf_counter() - start))
+        except robots.Cancelled:
+            self.say("Stopped before the arms were ready.")
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"
             self.say(f"Teleop stopped with an error: {self.error}")
             traceback.print_exc()
         finally:
-            NexArmFollower.configure = real_configure
+            if follower_cls is not None:
+                follower_cls.configure = real_configure
             for dev in (follower, leader):
                 try:
                     if dev is not None:
@@ -455,45 +513,179 @@ class Station:
                 self.status["fps"] = 0.0
             self.say("Teleop stopped.")
 
+    # ------------------------------------------------------- which arm it is
+
+    def _follower_config(self, cameras: dict):
+        kind = self.kind
+        if kind.raw_counts:
+            from lerobot.robots.nexarm_follower import NexArmFollowerConfig
+
+            return NexArmFollowerConfig(
+                port=self.cfg["follower_port"], cameras=cameras,
+                motion_acc=MOTION_ACC, motion_speed=MOTION_SPEED)
+        return robots.follower_config(
+            kind, self.cfg["follower_port"], self.cfg.get("follower_id"), cameras)
+
+    def _leader_config(self):
+        kind = self.kind
+        if kind.raw_counts:
+            from lerobot.teleoperators.nexarm_leader import NexArmLeaderConfig
+
+            return NexArmLeaderConfig(port=self.cfg["leader_port"])
+        return robots.leader_config(kind, self.cfg["leader_port"], self.cfg.get("leader_id"))
+
+    def _make_follower(self, cameras: dict):
+        """Build the follower. Nothing is opened or moved until connect()."""
+        if self.kind.raw_counts:
+            from lerobot.robots.nexarm_follower import NexArmFollower
+
+            return NexArmFollower(self._follower_config(cameras))
+        from lerobot.robots.utils import make_robot_from_config
+
+        return make_robot_from_config(self._follower_config(cameras))
+
+    def _make_leader(self):
+        if self.kind.raw_counts:
+            from lerobot.teleoperators.nexarm_leader import NexArmLeader
+
+            return NexArmLeader(self._leader_config())
+        from lerobot.teleoperators.utils import make_teleoperator_from_config
+
+        return make_teleoperator_from_config(self._leader_config())
+
+    def _limits_for(self, follower) -> dict[str, robots.Limits] | None:
+        return None if self.kind.raw_counts else robots.lerobot_limits(follower)
+
+    def _sane(self, values: dict) -> bool:
+        """Every joint reading believable, in this arm's own units."""
+        if not self._limits:
+            return reading_is_sane(values.values())
+        for key, value in values.items():
+            lim = self._limits.get(key)
+            if lim is not None:
+                if not lim.sane(value):
+                    return False
+            else:
+                try:
+                    if not math.isfinite(float(value)):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+        return True
+
+    # ------------------------------------------------- calibration on the page
+
+    @contextlib.contextmanager
+    def _page_prompts(self):
+        """Answer LeRobot's terminal prompts from the page instead.
+
+        LeRobot calibrates an arm the first time it is used on a computer, and it
+        does that with ``input()`` and by polling the keyboard for Enter. There is
+        no keyboard here, only a page, so both are pointed at the page's Next
+        button for as long as the arms are connecting. A NexArm never asks.
+        """
+        from lerobot.motors import motors_bus
+
+        real_input, real_enter = builtins.input, motors_bus.enter_pressed
+        station = self
+
+        def page_input(prompt=""):
+            text = str(prompt)
+            if "provided calibration file" in text:
+                # This arm already has a calibration on this computer: use it.
+                return ""
+            station._calibrating = robots.which_arm(text) or station._calibrating
+            station._ask(robots.friendly_prompt(text, station._calibrating))
+            return ""
+
+        def page_enter():
+            if station.prompt is None:
+                station.prompt = robots.ranges_prompt(station._calibrating)
+                station.say(station.prompt)
+            return station._take_next()
+
+        builtins.input = page_input
+        motors_bus.enter_pressed = page_enter
+        try:
+            yield
+        finally:
+            builtins.input = real_input
+            motors_bus.enter_pressed = real_enter
+            self.prompt = None
+
+    def _ask(self, text: str) -> None:
+        """Show a question and wait for Next. Stop cancels the wait."""
+        self._next.clear()
+        self.prompt = text
+        self.say(text)
+        while not self._next.wait(0.2):
+            if self._cancel.is_set():
+                self.prompt = None
+                raise robots.Cancelled("stopped from the page")
+        self._next.clear()
+        self.prompt = None
+
+    def _take_next(self) -> bool:
+        if self._cancel.is_set():
+            self.prompt = None
+            raise robots.Cancelled("stopped from the page")
+        if self._next.is_set():
+            self._next.clear()
+            self.prompt = None
+            return True
+        return False
+
+    def prompt_next(self) -> dict:
+        if self.prompt is None:
+            return {"ok": False, "why": "nothing is waiting for Next"}
+        self._next.set()
+        return {"ok": True}
+
     @staticmethod
     def _park_goal_before_torque(follower_cls):
         """Stop the follower snapping when its motors switch on.
 
-        ``configure()`` calls ``set_torque(True)``, and the servos come up aiming
-        at whatever Goal_Position was last written to them -- which, after a
+        ``configure()`` switches the torque on, and the servos come up aiming at
+        whatever Goal_Position was last written to them -- which, after a
         previous session, is a pose from minutes ago. The arm lunges there the
         instant torque arrives, before any of our code has sent an action. From
         the outside this looks like the opening sync jerking, because it happens
         one moment before the sync starts.
 
         The fix is to write where the arm actually IS as the goal, and only then
-        allow the torque on. Then switching the motors on holds it still.
+        allow the torque on. Then switching the motors on holds it still. The
+        writing itself is in robots.park_goal, because it differs per kind of bus.
 
         Returns the original configure so the caller can put it back.
         """
         real_configure = follower_cls.configure
 
         def parked_configure(self_robot):
-            try:
-                current = self_robot.bus.read_positions()
-                if reading_is_sane(current):
-                    self_robot.bus.write_positions(list(current))
-                    time.sleep(0.05)
-            except Exception:
-                # Worst case we are no worse off than the stock behaviour.
-                pass
+            # Worst case we are no worse off than the stock behaviour.
+            robots.park_goal(self_robot.bus)
             return real_configure(self_robot)
 
         follower_cls.configure = parked_configure
         return real_configure
 
-    def _rate_limit(self, action: dict, max_step: float = MAX_STEP_PER_TICK) -> dict:
-        """Never let a target be more than MAX_STEP_PER_TICK from the last one.
+    def _step_for(self, key: str, sync: bool) -> float:
+        lim = self._limits.get(key) if self._limits else None
+        if lim is not None:
+            return lim.sync_step if sync else lim.step
+        return SYNC_STEP_PER_TICK if sync else MAX_STEP_PER_TICK
+
+    def _rate_limit(self, action: dict, max_step: float | None = None,
+                    sync: bool = False) -> dict:
+        """Never let a target be more than one tick's allowance from the last one.
 
         Without this, one bad leader reading is a lunge. With it, the worst a bad
         reading can do is start a slow drift that Stop or the next good reading
         ends. The cost is that a genuinely fast hand movement is followed slightly
         behind, which for demonstrating a task to a robot is a fair trade.
+
+        The allowance is MAX_STEP_PER_TICK counts on a NexArm and the joint's own
+        limit on anything else; ``sync`` selects the slow allowance used while the
+        follower is first walked over to the leader.
         """
         limited = {}
         for k, raw in action.items():
@@ -502,7 +694,8 @@ class Station:
             if prev is None:
                 limited[k] = want
             else:
-                step = max(-max_step, min(max_step, want - prev))
+                allowed = max_step if max_step is not None else self._step_for(k, sync)
+                step = max(-allowed, min(allowed, want - prev))
                 limited[k] = prev + step
         self._last_sent = limited
         return limited
@@ -529,10 +722,10 @@ class Station:
         start = {k: float(obs[k]) for k in target if k in obs}
         if not start:
             return False
-        if not reading_is_sane(start.values()):
+        if not self._sane(start):
             self.say(f"Follower reading looks wrong: {[round(v) for v in start.values()]}")
             return False
-        if not reading_is_sane([target[k] for k in start]):
+        if not self._sane({k: target[k] for k in start}):
             self.say(f"Leader reading looks wrong: {[round(target[k]) for k in start]}")
             return False
 
@@ -541,9 +734,10 @@ class Station:
         # Time the sync to the distance rather than using a fixed number, and
         # cap every tick as well. Either alone is not enough: a fixed duration
         # makes a large gap fast, and an eased curve still peaks in the middle.
-        seconds = gap / SYNC_COUNTS_PER_SECOND
+        # Each joint is timed in its own units; the slowest one sets the pace.
+        seconds = max(abs(target[k] - start[k]) / self._sync_rate(k) for k in start)
         seconds = max(SYNC_MIN_SECONDS, min(SYNC_MAX_SECONDS, seconds))
-        self.say(f"Closing a {gap:.0f} count gap gently, over about {seconds:.0f} seconds.")
+        self.say(f"Closing a gap of {gap:.0f} gently, over about {seconds:.0f} seconds.")
 
         self._last_sent = dict(start)
         steps = max(1, int(seconds * fps))
@@ -555,7 +749,7 @@ class Station:
             t0 = time.perf_counter()
             follower.send_action(self._rate_limit(
                 {k: start[k] + (target[k] - start[k]) * e for k in start},
-                max_step=SYNC_STEP_PER_TICK))
+                sync=True))
             precise_sleep(1.0 / fps - (time.perf_counter() - t0))
 
         # Hand the live loop a clean slate: the sync ended wherever the ramp
@@ -563,6 +757,10 @@ class Station:
         self._last_sent = dict(self._last_sent)
         self.say("Synced.")
         return True
+
+    def _sync_rate(self, key: str) -> float:
+        lim = self._limits.get(key) if self._limits else None
+        return lim.sync_rate if lim is not None else SYNC_COUNTS_PER_SECOND
 
     # ----------------------------------------------------------------- record
 
@@ -581,13 +779,14 @@ class Station:
         with self.lock:
             if self.mode != "idle":
                 return {"ok": False, "why": f"already {self.mode}"}
-            ok, why = detect.config_is_usable(self.cfg)
+            ok, why = self.usable()
             if not ok:
                 return {"ok": False, "why": why}
             if not task.strip():
                 return {"ok": False, "why": "give the job a name first"}
             self.error = None
             self.mode = "record"
+            self._cancel.clear()
             self.events.update(exit_early=False, rerecord_episode=False, stop_recording=False)
             self.status.update(episode=0, target_episodes=1, phase="starting")
             # lerobot-record opens the cameras itself, so let go of them first.
@@ -598,25 +797,78 @@ class Station:
             ).start()
             return {"ok": True}
 
-    def _record_worker(self, task: str) -> None:
+    def record_config(self, task: str):
+        """Exactly what is handed to lerobot's record() for one try of ``task``.
+
+        Built here and nowhere else, so the selftest checks the real thing. The
+        dataset folder is named after the kind of arm as well as the job: a
+        recording only makes sense played back, or trained on, with the same kind.
+        """
         from lerobot.cameras.opencv import OpenCVCameraConfig
         from lerobot.configs.dataset import DatasetRecordConfig
-        from lerobot.robots.nexarm_follower import NexArmFollower, NexArmFollowerConfig
         from lerobot.scripts import lerobot_record as lr
-        from lerobot.teleoperators.nexarm_leader import NexArmLeaderConfig
 
         fps = int(self.cfg.get("fps", 30))
         slug = "".join(c if c.isalnum() else "_" for c in task.lower()).strip("_")[:40] or "task"
-
         cams = {
             name: OpenCVCameraConfig(index_or_path=int(idx), width=640, height=480, fps=fps)
             for name, idx in self.cfg.get("cameras", {}).items()
         }
+        root = self.datasets_dir() / f"{self.kind.key}_{slug}"
 
-        # Three patches, all undone in the finally block.
+        # Already recorded this job before? Add to it instead of colliding
+        # with it. LeRobotDataset.create refuses to write over an existing
+        # dataset, and a child pressing the same button twice should get a
+        # second try, not an error.
+        resume = (root / "meta" / "info.json").is_file()
+
+        return lr.RecordConfig(
+            robot=self._follower_config(cams),
+            teleop=self._leader_config(),
+            dataset=DatasetRecordConfig(
+                repo_id=f"local_user/{root.name}",
+                single_task=task,
+                root=str(root),
+                fps=fps,
+                # One try per press. The stop comes from the button, not a
+                # clock, so the episode limit is a ceiling that should never
+                # be reached -- an hour of continuous recording.
+                num_episodes=1,
+                episode_time_s=NO_TIME_LIMIT_SECONDS,
+                # No tidy-up window either. With a single episode lerobot
+                # skips the reset phase anyway; this makes it instant if a
+                # re-record ever reaches it.
+                reset_time_s=0,
+                # The dataset is video of the room, and the room has children in
+                # it. lerobot's own default here is True, which would publish it
+                # to a public Hugging Face dataset the moment recording finished.
+                push_to_hub=False,
+            ),
+            resume=resume,
+            display_data=False,     # frames go to the browser, not to rerun
+            play_sounds=False,
+        )
+
+    def _record_worker(self, task: str) -> None:
+        from lerobot.scripts import lerobot_record as lr
+
+        # Three patches, all undone in the finally block. They go on the
+        # follower's class because record() builds its own instance of it.
         real_listener = lr.init_keyboard_listener
-        real_get_obs = NexArmFollower.get_observation
-        real_send = NexArmFollower.send_action
+        try:
+            probe = self._make_follower(cameras={})     # for its class and limits only
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+            self.say(f"Recording could not start: {self.error}")
+            with self.lock:
+                self.mode = "idle"
+                self.status["phase"] = ""
+            self.open_cameras()
+            return
+        follower_cls = type(probe)
+        self._limits = self._limits_for(probe)
+        real_get_obs = follower_cls.get_observation
+        real_send = follower_cls.send_action
         station = self
         self._last_sent = {}
 
@@ -639,72 +891,43 @@ class Station:
             robot rather than in the caller, or recording would be the one mode
             that can still lunge.
             """
-            if not reading_is_sane(action.values()):
+            if not station._sane(action):
                 return dict(station._last_sent) or action
             return real_send(self_robot, station._rate_limit(action))
 
-        real_configure = self._park_goal_before_torque(NexArmFollower)
+        real_configure = self._park_goal_before_torque(follower_cls)
         try:
             lr.init_keyboard_listener = browser_listener
-            NexArmFollower.get_observation = teeing_get_obs
-            NexArmFollower.send_action = limited_send
+            follower_cls.get_observation = teeing_get_obs
+            follower_cls.send_action = limited_send
 
-            out_dir = self.datasets_dir()
-            out_dir.mkdir(parents=True, exist_ok=True)
-            root = out_dir / f"nexarm_{slug}"
-
-            # Already recorded this job before? Add to it instead of colliding
-            # with it. LeRobotDataset.create refuses to write over an existing
-            # dataset, and a child pressing the same button twice should get a
-            # second try, not an error.
-            resume = (root / "meta" / "info.json").is_file()
-
-            cfg = lr.RecordConfig(
-                robot=NexArmFollowerConfig(
-                    port=self.cfg["follower_port"], cameras=cams,
-                    motion_acc=MOTION_ACC, motion_speed=MOTION_SPEED),
-                teleop=NexArmLeaderConfig(port=self.cfg["leader_port"]),
-                dataset=DatasetRecordConfig(
-                    repo_id=f"local_user/nexarm_{slug}",
-                    single_task=task,
-                    root=str(root),
-                    fps=fps,
-                    # One try per press. The stop comes from the button, not a
-                    # clock, so the episode limit is a ceiling that should never
-                    # be reached -- an hour of continuous recording.
-                    num_episodes=1,
-                    episode_time_s=NO_TIME_LIMIT_SECONDS,
-                    # No tidy-up window either. With a single episode lerobot
-                    # skips the reset phase anyway; this makes it instant if a
-                    # re-record ever reaches it.
-                    reset_time_s=0,
-                    # The dataset is video of the room, and the room has children in
-                    # it. lerobot's own default here is True, which would publish it
-                    # to a public Hugging Face dataset the moment recording finished.
-                    push_to_hub=False,
-                ),
-                resume=resume,
-                display_data=False,     # frames go to the browser, not to rerun
-                play_sounds=False,
-            )
-            self.status["phase"] = "recording"
+            self.datasets_dir().mkdir(parents=True, exist_ok=True)
+            cfg = self.record_config(task)
+            root = Path(cfg.dataset.root)
+            self.status.update(phase="recording", root=str(root))
             self.say(f'Recording "{task}". Take as long as you need, then press Done.')
-            self.say(f"{'Adding to' if resume else 'Saving to'} {root} on this computer only.")
+            self.say(f"{'Adding to' if cfg.resume else 'Saving to'} {root} on this computer only.")
             self._watch_episodes()
-            lr.record(cfg)
+            # The first time a LeRobot arm is used on this computer, record()
+            # calibrates it while connecting, and the questions come to the page.
+            with self._page_prompts():
+                lr.record(cfg)
             self.say("Try saved.")
+        except robots.Cancelled:
+            self.say("Stopped before the arms were ready. Nothing was recorded.")
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"
             self.say(f"Recording stopped with an error: {self.error}")
             traceback.print_exc()
         finally:
             lr.init_keyboard_listener = real_listener
-            NexArmFollower.get_observation = real_get_obs
-            NexArmFollower.send_action = real_send
-            NexArmFollower.configure = real_configure
+            follower_cls.get_observation = real_get_obs
+            follower_cls.send_action = real_send
+            follower_cls.configure = real_configure
             with self.lock:
                 self.mode = "idle"
                 self.status["phase"] = ""
+                self.status.pop("root", None)
             self.open_cameras()
 
     def _watch_episodes(self) -> None:
@@ -712,16 +935,15 @@ class Station:
 
         record() does not expose its counter, and reaching into its locals would
         break on the next lerobot bump. The episode directory is a stable thing
-        to count instead.
+        to count instead -- the one this try is going into, which the worker
+        names in status["root"].
         """
         def run():
-            root = Path(self.status.get("root", "")) if self.status.get("root") else None
             while self.mode == "record":
                 try:
-                    if root is None:
-                        root = next(self.datasets_dir().glob("nexarm_*"), None)
-                    if root is not None:
-                        n = len(list((root / "data").rglob("*.parquet")))
+                    root = self.status.get("root")
+                    if root:
+                        n = len(list((Path(root) / "data").rglob("*.parquet")))
                         self.status["episode"] = n
                 except Exception:
                     pass
@@ -735,24 +957,54 @@ class Station:
         with self.lock:
             if self.mode != "idle":
                 return {"ok": False, "why": f"already {self.mode}"}
-            ok, why = detect.config_is_usable(self.cfg)
+            ok, why = self.usable()
             if not ok:
                 return {"ok": False, "why": why}
             root = self.datasets_dir() / name
             if not (root / "meta" / "info.json").is_file():
                 return {"ok": False, "why": f"no recording called {name}"}
+            other = self._recorded_on_other_kind(root)
+            if other:
+                return {"ok": False, "why": f"{name} was recorded on a {other}. "
+                                            f"This computer is set up for the {self.kind.label}."}
             self.error = None
             self.mode = "replay"
+            self._cancel.clear()
             self.status.update(phase=f"replaying {name} episode {episode}")
             threading.Thread(target=self._replay_worker, args=(name, episode),
                              name="replay", daemon=True).start()
             return {"ok": True}
 
+    def _recorded_on_other_kind(self, root: Path) -> str | None:
+        """The robot a recording was made on, if it is not the one plugged in.
+
+        Replaying one arm's joint values on a different kind of arm is at best an
+        error from lerobot and at worst a move nobody intended, so it is refused
+        up front. A recording that does not say which robot made it is allowed.
+        """
+        try:
+            recorded = json.loads((root / "meta" / "info.json").read_text(encoding="utf-8")
+                                  ).get("robot_type")
+            here = self._make_follower(cameras={}).name
+        except Exception:
+            return None
+        return recorded if recorded and recorded != here else None
+
     def _replay_worker(self, name: str, episode: int) -> None:
-        from lerobot.robots.nexarm_follower import NexArmFollower, NexArmFollowerConfig
         from lerobot.scripts import lerobot_replay as lrp
 
-        real_send = NexArmFollower.send_action
+        try:
+            probe = self._make_follower(cameras={})     # for its class and limits only
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+            self.say(f"Replay could not start: {self.error}")
+            with self.lock:
+                self.mode = "idle"
+                self.status["phase"] = ""
+            return
+        follower_cls = type(probe)
+        self._limits = self._limits_for(probe)
+        real_send = follower_cls.send_action
         station = self
         self._last_sent = {}
         root = self.datasets_dir() / name
@@ -767,36 +1019,35 @@ class Station:
             # often enough to abort it promptly.
             if station._stop.is_set():
                 raise KeyboardInterrupt("stopped from the page")
-            if not reading_is_sane(action.values()):
+            if not station._sane(action):
                 return dict(station._last_sent) or action
             return real_send(self_robot, station._rate_limit(action))
 
-        real_configure = self._park_goal_before_torque(NexArmFollower)
+        real_configure = self._park_goal_before_torque(follower_cls)
         try:
             self._stop.clear()
-            NexArmFollower.send_action = limited_send
+            follower_cls.send_action = limited_send
             self.say(f"Replaying {name}, episode {episode}. Keep hands clear.")
             cfg = lrp.ReplayConfig(
-                robot=NexArmFollowerConfig(
-                    port=self.cfg["follower_port"], cameras={},
-                    motion_acc=MOTION_ACC, motion_speed=MOTION_SPEED),
+                robot=self._follower_config({}),
                 dataset=lrp.DatasetReplayConfig(
                     repo_id=f"local_user/{name}", root=str(root),
                     episode=int(episode), fps=int(self.cfg.get("fps", 30)),
                 ),
                 play_sounds=False,
             )
-            lrp.replay(cfg)
+            with self._page_prompts():
+                lrp.replay(cfg)
             self.say("Replay finished.")
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, robots.Cancelled):
             self.say("Replay stopped.")
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"
             self.say(f"Replay stopped with an error: {self.error}")
             traceback.print_exc()
         finally:
-            NexArmFollower.send_action = real_send
-            NexArmFollower.configure = real_configure
+            follower_cls.send_action = real_send
+            follower_cls.configure = real_configure
             with self.lock:
                 self.mode = "idle"
                 self.status["phase"] = ""
@@ -808,6 +1059,8 @@ class Station:
             if self.mode == "idle":
                 return {"ok": True, "why": "nothing was running"}
             self.say("Stopping.")
+            # Also ends a wait on the Next button, if calibration is asking.
+            self._cancel.set()
             if self.mode == "record":
                 self.events["stop_recording"] = True
                 self.events["exit_early"] = True
@@ -825,13 +1078,14 @@ class Station:
         with self.lock:
             if self.mode != "idle":
                 return {"ok": False, "why": "press Stop first"}
-            from station import release as rel
-
+            kind = self.kind or robots.NEXARM
             ports = [p for p in (self.cfg.get("leader_port"), self.cfg.get("follower_port")) if p]
             if not ports:
-                ports = detect.candidate_ports()
+                # Nothing set up yet: the only arms that can be released blind
+                # are NexArms, which is what this did before there was a choice.
+                kind, ports = robots.NEXARM, detect.candidate_ports()
             self.close_cameras()
-            done = [p for p in ports if rel.release(p)]
+            done = [p for p in ports if robots.release(kind, p)]
             for p in done:
                 self.say(f"{p}: motors off, that arm moves by hand now")
             if not done:
@@ -842,12 +1096,16 @@ class Station:
 
     def snapshot(self) -> dict:
         ok, why = detect.config_is_usable(self.cfg)
+        kind = self.kind
         return {
             "mode": self.mode,
             "setup_stage": self.setup_stage,
             "config_ok": ok,
             "config_why": why,
             "config": self.cfg,
+            "robot": {"key": kind.key, "label": kind.label} if kind else None,
+            "robots": robots.choices(),
+            "prompt": self.prompt,
             "cameras": self.camera_names(),
             "status": self.status,
             "error": self.error,

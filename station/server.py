@@ -133,7 +133,9 @@ def make_handler(station):
             body = self._read_json()
 
             if path == "/api/detect/start":
-                self._send_json(station.begin_arm_detect())
+                self._send_json(station.begin_arm_detect(kind=str(body.get("kind") or "")))
+            elif path == "/api/prompt/next":
+                self._send_json(station.prompt_next())
             elif path == "/api/detect/poll":
                 self._send_json(station.poll_arm_detect())
             elif path == "/api/cameras/swap":

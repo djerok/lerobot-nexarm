@@ -12,6 +12,21 @@ switch the motors off if something gets stuck.
 
 You never type a COM port or a camera number.
 
+## Which robots
+
+Any leader/follower arm pair: **NexArm**, **SO-100 / SO-101**, **Koch**,
+**OpenManipulator-X**, and any other single-arm pair LeRobot ships whose motor
+software is installed. The page works out which one is plugged in from the USB
+chip and by talking to the motors (it never moves them to find out). If it guesses
+wrong, pick the robot from the list on the first screen.
+
+**The first time a non-NexArm arm is used on a computer**, LeRobot needs to
+calibrate it. The page walks through it with a **Next** button: hold the arm (its
+motors are off), put every joint about halfway, press Next, then move every joint
+to both ends and press Next. That is saved, and never asked again on that computer.
+SO arms are remembered by their USB adapter's serial number, so moving a cable to
+another socket does not mean doing the wave again.
+
 ## The first time
 
 1. Plug both arms into the computer with their USB cables.
@@ -101,7 +116,7 @@ do the fifteen-second wave again. Nothing is broken.
 python station/selftest.py
 ```
 
-Runs 82 checks: detection, the page, the API, the camera streams, the speed limit,
+Runs 134 checks: detection of every kind of arm, the page, the API, the camera streams, the speed limit,
 the railed-reading guard, and that recordings are not set to upload. It needs the
 cameras but never moves an arm.
 
@@ -110,7 +125,8 @@ cameras but never moves an arm.
 | File | Does what |
 |---|---|
 | `start.py` | The one command. Finds things, serves the page, opens the browser. |
-| `station/detect.py` | Finds the arms and the cameras. |
+| `station/detect.py` | Finds the USB ports and the cameras. |
+| `station/robots.py` | Every kind of arm: recognising it, the wave test, its safety numbers. |
 | `station/hardware.py` | Owns the arms and cameras. Speed limits live here. |
 | `station/server.py` | The local web server and the camera streams. |
 | `station/ui.html` | The page. |

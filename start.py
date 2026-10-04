@@ -22,6 +22,7 @@ whose code page is cp1252, which raises on anything else rather than substitutin
 
 from __future__ import annotations
 
+import importlib
 import os
 import shutil
 import subprocess
@@ -52,6 +53,16 @@ RECORD_PINS = (
     "pandas>=2.0.0,<3.0.0",
     "pyarrow>=21.0.0,<30.0.0",
     "jsonlines>=4.0.0,<5.0.0",
+)
+
+# The motor SDKs for every arm that is not a NexArm: Feetech for SO-100/SO-101,
+# Dynamixel for Koch and OpenManipulator-X. Same ranges as lerobot's own extras.
+# None of them is needed for a NexArm, so a missing one is installed if it can be
+# and otherwise only means that kind of arm is not offered.
+ARM_SDKS = (
+    ("scservo_sdk", "feetech-servo-sdk>=1.0.0,<2.0.0", "SO-100 / SO-101"),
+    ("dynamixel_sdk", "dynamixel-sdk>=3.7.31,<3.9.0", "Koch, OpenManipulator-X"),
+    ("deepdiff", "deepdiff>=7.0.1,<9.0.0", "both of the above"),
 )
 
 
@@ -115,6 +126,34 @@ def auto_install() -> bool:
     result = subprocess.run(
         [uv, "pip", "install", "--python", str(venv), *wanted])
     return result.returncode == 0
+
+
+def missing_arm_sdks() -> list[tuple[str, str, str]]:
+    out = []
+    for module, spec, arms in ARM_SDKS:
+        try:
+            __import__(module)
+        except Exception:
+            out.append((module, spec, arms))
+    return out
+
+
+def install_arm_sdks() -> None:
+    """Fetch the SDKs for non-NexArm arms if any are missing. Never fatal."""
+    missing = missing_arm_sdks()
+    if not missing:
+        return
+    venv = VENV_PY if VENV_PY.exists() else VENV_PY_POSIX
+    uv = shutil.which("uv") or shutil.which(
+        "uv.exe", path=str(Path.home() / ".local" / "bin"))
+    if not (venv.exists() and uv):
+        return
+    print("Adding support for more kinds of arm (once):")
+    for _, spec, arms in missing:
+        print(f"  {spec}  -- {arms}")
+    subprocess.run([uv, "pip", "install", "--python", str(venv),
+                    *[spec for _, spec, _ in missing]])
+    importlib.invalidate_caches()
 
 
 def can_spawn(python: Path) -> tuple[bool, str]:
@@ -224,6 +263,13 @@ def doctor() -> int:
         except Exception as exc:
             print(f"  {module:<17} MISSING ({package or 'this folder'}) -- {type(exc).__name__}")
     print(f"  recording         {'ok' if recording_works() else 'MISSING the record dependencies'}")
+    for module, spec, arms in ARM_SDKS:
+        try:
+            __import__(module)
+            state = "ok"
+        except Exception:
+            state = f"MISSING ({spec}) -- no {arms}"
+        print(f"  {module:<17} {state}")
 
     try:
         from station import detect
@@ -268,13 +314,20 @@ def main() -> int:
         print("  macOS:    bash setup.sh")
         return 1
 
+    install_arm_sdks()
+
     # Imported after the venv check, because these import lerobot.
-    from station import server
+    from station import robots, server
     from station.hardware import Station
 
     print("=" * 58)
     print(" Robot Station")
     print("=" * 58)
+
+    # Loading LeRobot's list of arms takes a few seconds; do it before the page
+    # asks for it rather than while a child waits on the first screen.
+    print("  Arms this station can drive: "
+          + ", ".join(c["label"] for c in robots.choices()))
 
     station = Station()
     usable, _ = station.load()

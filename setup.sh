@@ -72,6 +72,14 @@ uv pip install --python "$PY" \
     "pyarrow>=21.0.0,<30.0.0" \
     "jsonlines>=4.0.0,<5.0.0"
 
+# Motor SDKs for the arms that are not a NexArm: Feetech (SO-100 / SO-101) and
+# Dynamixel (Koch, OpenManipulator-X). Same ranges as lerobot's own extras.
+echo "      adding support for SO-101, Koch and OpenManipulator arms..."
+uv pip install --python "$PY" \
+    "feetech-servo-sdk>=1.0.0,<2.0.0" \
+    "dynamixel-sdk>=3.7.31,<3.9.0" \
+    "deepdiff>=7.0.1,<9.0.0"
+
 "$PY" -c "import lerobot, serial, cv2; from lerobot.scripts import lerobot_record, lerobot_replay; print('imports OK')"
 echo "[3/4] dependencies installed"
 

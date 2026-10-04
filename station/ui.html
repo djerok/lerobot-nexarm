@@ -53,7 +53,7 @@
   button.go { background: var(--go); }
   button.rec { background: var(--rec); }
   button.quiet { background: #333b47; }
-  input {
+  input, select {
     font: inherit; color: var(--ink); background: #10131a;
     border: 1px solid var(--line); border-radius: 9px; padding: 12px 14px;
   }
@@ -97,12 +97,24 @@
 <main>
   <div id="err" class="err hide"></div>
 
+  <!-- First time an arm is used on this computer: LeRobot's calibration asks -->
+  <section id="promptCard" class="card hide">
+    <h2>Getting the arm ready</h2>
+    <p id="promptText" style="font-size:21px"></p>
+    <button class="big go" onclick="post('/api/prompt/next')">Next</button>
+    <button class="quiet" onclick="post('/api/stop')">Stop</button>
+    <p class="dim">This only happens the first time an arm is used on this computer.</p>
+  </section>
+
   <!-- 1. Set-up: only shown until the arms are known -->
   <section id="setupCard" class="card hide">
     <h2>Let's find your robot</h2>
     <p id="setupWhy" class="dim"></p>
     <div id="setupIdle">
       <p>Plug both arms into the computer and switch them on. Then press the button.</p>
+      <p><label><span>Which robot?</span>
+        <select id="kindPick"><option value="">Work it out for me</option></select>
+      </label></p>
       <button class="big go" onclick="startDetect()">Find my robot</button>
     </div>
     <div id="setupDrag" class="hide">
@@ -190,6 +202,10 @@
     <button class="quiet" id="releaseBtn" onclick="releaseMotors()">
       Switch the motors off
     </button>
+    <p class="dim">Plugged a different robot into this computer?</p>
+    <button class="quiet" id="refindBtn" onclick="refind = true; refresh()">
+      Find a different robot
+    </button>
   </section>
 
   <section class="card">
@@ -204,6 +220,7 @@ let dragging = false;
 let streamsFor = "";
 let datasetsKey = "";
 let dirTouched = false;
+let refind = false;          // set-up shown again on request, even with a working setup
 
 const $ = id => document.getElementById(id);
 const busyNow = s => s.mode !== "idle";
@@ -223,8 +240,19 @@ async function post(path, body) {
 }
 
 async function startDetect() {
-  const out = await post("/api/detect/start");
+  const out = await post("/api/detect/start", {kind: $("kindPick").value});
   if (out.ok) { dragging = true; pollDetect(); }
+}
+
+let kindsKey = "";
+function buildKinds(list) {
+  const key = list.map(k => k.key).join(",");
+  if (key === kindsKey) return;            // leave the dropdown alone while it is in use
+  kindsKey = key;
+  const keep = $("kindPick").value;
+  $("kindPick").innerHTML = '<option value="">Work it out for me</option>' +
+    list.map(k => `<option value="${k.key}">${k.label}</option>`).join("");
+  $("kindPick").value = keep;
 }
 
 async function pollDetect() {
@@ -297,13 +325,19 @@ async function refresh() {
 
   const c = s.config || {};
   $("ports").textContent = c.leader_port
-    ? `leader ${c.leader_port} - follower ${c.follower_port}` : "";
+    ? `${s.robot ? s.robot.label + ": " : ""}leader ${c.leader_port} - follower ${c.follower_port}` : "";
+  buildKinds(s.robots || []);
+
+  $("promptCard").classList.toggle("hide", !s.prompt);
+  $("promptText").textContent = s.prompt || "";
 
   $("err").classList.toggle("hide", !s.error);
   if (s.error) $("err").textContent = s.error;
 
   const ready = s.config_ok;
-  $("setupCard").classList.toggle("hide", ready && s.setup_stage !== "dragging");
+  if (dragging) refind = false;            // the new search has started
+  $("setupCard").classList.toggle("hide", ready && s.setup_stage !== "dragging" && !refind);
+  $("refindBtn").disabled = busyNow(s);
   $("setupWhy").textContent = ready ? "" : (s.config_why || "");
   $("setupIdle").classList.toggle("hide", dragging);
   $("setupDrag").classList.toggle("hide", !dragging);
@@ -335,9 +369,11 @@ async function refresh() {
     s.mode === "teleop" ? `running at ${s.status.fps} steps a second` : "";
 
   const rec = s.mode === "record";
-  $("recLive").classList.toggle("hide", !rec);
+  $("recLive").classList.toggle("hide", !rec || !!s.prompt);
   if (rec) {
-    const job = (s.datasets || []).find(d => "nexarm_" + slug($("task").value) === d.name);
+    // Must match the folder name built in hardware.py: robot kind, then the job.
+    const prefix = (c.robot_type || "nexarm") + "_";
+    const job = (s.datasets || []).find(d => prefix + slug($("task").value) === d.name);
     const have = job ? job.episodes : 0;
     $("recCount").textContent = have
       ? `Recording. This job already has ${have} saved ${have === 1 ? "try" : "tries"}.`

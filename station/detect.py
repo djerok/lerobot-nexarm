@@ -12,7 +12,8 @@ the wrist -- is guessed here and made fixable with a button instead of a prompt.
 The role of each arm cannot be read off the hardware. Both boards enumerate as
 the same CH340 with an empty USB serial number and both answer the same protocol
 identically, so the role is decided by behaviour: the leader runs torque-off and
-a person can drag it, the follower is held by its servos. Hence the drag test.
+a person can drag it, the follower is held by its servos. Hence the drag test,
+which lives in robots.py now that it serves every kind of arm.
 """
 
 from __future__ import annotations
@@ -60,11 +61,9 @@ BAUD = 1_000_000
 
 # USB VID:PID of the CH340 bridge both NexArm ESP32 boards sit behind.
 CH340 = (0x1A86, 0x7523)
-
-# A real drag swings a joint by hundreds of counts; sensor noise is single digits.
-# Both a floor and a clear gap are required before a result is trusted.
-DRAG_FLOOR = 100
-DRAG_RATIO = 3
+# The SO-100 / SO-101's Feetech bus boards sit behind a CH343 instead. The NexArm
+# probes here never touch one; robots.py drives them through LeRobot.
+CH343 = (0x1A86, 0x55D3)
 
 
 def build_frame(device_id: int, cmd: int, args: bytes = b"") -> bytes:
@@ -99,8 +98,30 @@ def read_positions(ser, timeout: float = 0.25):
     return None
 
 
+def usb_serial_ports() -> list:
+    """Serial ports that are real USB adapters.
+
+    Bluetooth "Standard Serial over Bluetooth link" ports carry no USB VID, and
+    opening one that belongs to a paired phone or headset blocks for about 13 s
+    before failing with a semaphore timeout (measured on a laptop with two paired
+    devices). Probing those is what made the page hang.
+    """
+    from serial.tools import list_ports
+
+    return [p for p in list_ports.comports() if p.vid is not None]
+
+
+def is_so101_board(p) -> bool:
+    return (p.vid, p.pid) == CH343 or "CH343" in (p.description or "")
+
+
 def candidate_ports() -> list[str]:
-    """Every CH340 serial port. Falls back to all ports rather than refusing.
+    """Every CH340 serial port. Falls back to other USB serial ports, never to all.
+
+    It used to fall back to every port, Bluetooth included, whenever no CH340 was
+    plugged in -- an SO-101 (CH343 boards), or simply before the cables went in --
+    and then sat ~13 s on each paired Bluetooth device. That read as the station
+    being unresponsive and never connecting.
 
     macOS lists each USB serial adapter twice, as /dev/tty.* and /dev/cu.*. They
     are the same hardware, but opening the tty side blocks waiting for a carrier
@@ -108,15 +129,15 @@ def candidate_ports() -> list[str]:
     is usable, and a duplicate here would also break the drag test, which needs
     exactly two ports to compare.
     """
-    from serial.tools import list_ports
-
-    ports = list(list_ports.comports())
+    usb = usb_serial_ports()
     found = [
-        p.device for p in ports
+        p.device for p in usb
         if (p.vid, p.pid) == CH340 or "CH340" in (p.description or "")
     ]
     if not found:
-        found = [p.device for p in ports]
+        # Never an SO-101 bus: the probe frames go to broadcast ID 0xFF, which
+        # every Feetech servo on that bus would receive.
+        found = [p.device for p in usb if not is_so101_board(p)]
     if IS_MAC:
         callout = [d for d in found if "/cu." in d]
         if callout:
@@ -130,81 +151,23 @@ def port_exists(port: str) -> bool:
     return any(p.device == port for p in list_ports.comports())
 
 
-class ArmSession:
-    """Holds both serial ports open across the drag test, then puts them back.
+def remap_by_serial(cfg: dict) -> bool:
+    """Follow arms to new COM numbers by their USB serial numbers.
 
-    The drag test needs the ports open for as long as a person is waving an arm,
-    which is many HTTP requests. Opening per request would fight the exclusive
-    lock Windows puts on a COM port, so the session is kept and closed on exit.
+    COM numbers move when a cable goes into a different socket; a USB adapter's
+    serial number does not. Where the setup recorded one -- the SO boards' CH343
+    has one, the NexArm's CH340 does not -- the port is looked up again instead of
+    sending a child back to the wave test. Returns True if anything changed.
     """
-
-    def __init__(self):
-        self.arms: dict[str, object] = {}
-        self.baseline: dict[str, list[int] | None] = {}
-        self.moved: dict[str, int] = {}
-
-    def open_all(self, log=print) -> list[str]:
-        import serial
-
-        ports = candidate_ports()
-        if not ports:
-            log("No USB serial ports at all. Plug the arms in and switch them on.")
-            return []
-
-        log(f"Checking {len(ports)} serial port(s) at {BAUD} baud.")
-        for port in ports:
-            try:
-                ser = serial.Serial(port, BAUD, timeout=0.3)
-            except Exception as exc:
-                log(f"  {port}: cannot open ({exc})")
-                continue
-            time.sleep(0.25)
-            # CMD 68 puts the slave board into bridge mode. Harmless on the
-            # master, and it is what makes a follower report positions at all.
-            ser.write(build_frame(SYSTEM_ID, CMD_LEROBOT_MODE, bytes([1])))
-            time.sleep(0.25)
-            if read_positions(ser) is None:
-                log(f"  {port}: no reply, not a NexArm board")
-                ser.close()
-                continue
-            log(f"  {port}: NexArm board answering")
-            self.arms[port] = ser
-
-        for port, ser in self.arms.items():
-            self.baseline[port] = read_positions(ser)
-            self.moved[port] = 0
-        return list(self.arms)
-
-    def sample(self) -> dict[str, int]:
-        """One pass over both arms, updating the largest movement seen so far."""
-        for port, ser in self.arms.items():
-            pos = read_positions(ser)
-            base = self.baseline.get(port)
-            if pos and base:
-                delta = max(abs(a - b) for a, b in zip(pos, base))
-                if delta > self.moved[port]:
-                    self.moved[port] = delta
-        return dict(self.moved)
-
-    def verdict(self) -> tuple[str | None, str | None]:
-        if len(self.moved) < 2:
-            return None, None
-        ranked = sorted(self.moved, key=lambda p: self.moved[p], reverse=True)
-        top, rest = ranked[0], ranked[1]
-        if self.moved[top] > DRAG_FLOOR and self.moved[top] > self.moved[rest] * DRAG_RATIO:
-            return top, rest
-        return None, None
-
-    def close(self):
-        for ser in self.arms.values():
-            try:
-                # Leave the slave board the way it was found.
-                ser.write(build_frame(SYSTEM_ID, CMD_LEROBOT_MODE, bytes([0])))
-                time.sleep(0.05)
-                ser.close()
-            except Exception:
-                pass
-        self.arms.clear()
+    serials = {p.serial_number: p.device for p in usb_serial_ports() if p.serial_number}
+    changed = False
+    for role in ("leader", "follower"):
+        serial = cfg.get(f"{role}_serial")
+        port = serials.get(serial) if serial else None
+        if port and cfg.get(f"{role}_port") != port:
+            cfg[f"{role}_port"] = port
+            changed = True
+    return changed
 
 
 def probe_cameras(limit: int = 6, log=print) -> list[int]:

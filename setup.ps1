@@ -77,6 +77,14 @@ Write-Host "      adding the recording dependencies..." -ForegroundColor Yellow
     "pyarrow>=21.0.0,<30.0.0" `
     "jsonlines>=4.0.0,<5.0.0"
 
+# Motor SDKs for the arms that are not a NexArm: Feetech (SO-100 / SO-101) and
+# Dynamixel (Koch, OpenManipulator-X). Same ranges as lerobot's own extras.
+Write-Host "      adding support for SO-101, Koch and OpenManipulator arms..." -ForegroundColor Yellow
+& $uv.Source pip install --python $py `
+    "feetech-servo-sdk>=1.0.0,<2.0.0" `
+    "dynamixel-sdk>=3.7.31,<3.9.0" `
+    "deepdiff>=7.0.1,<9.0.0"
+
 & $py -c "import lerobot, serial, cv2; from lerobot.scripts import lerobot_record, lerobot_replay; print('imports OK')"
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Install finished but the imports failed. Nothing below will work yet." -ForegroundColor Red
