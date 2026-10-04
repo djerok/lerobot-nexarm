@@ -49,9 +49,33 @@ def camera_backend():
 
 
 def open_capture(index: int):
+    """Open a camera at 640x480, compressed (MJPG) where the camera can do it.
+
+    OpenCV's default on Windows is raw YUY2: about 150 Mbit/s per camera at
+    640x480, 30 fps. Two cameras on one USB hub, beside the arms' adapters, ran
+    out of bandwidth -- frames dropped, cameras froze and dropped off the bus.
+    MJPG is about a tenth of that. The format must be set before the size, and
+    a camera that cannot do MJPG just stays as it was.
+    """
     import cv2
 
-    return cv2.VideoCapture(int(index), camera_backend())
+    cap = cv2.VideoCapture(int(index), camera_backend())
+    if cap.isOpened():
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+    return cap
+
+
+def capture_format(cap) -> str:
+    import cv2
+
+    try:
+        code = int(cap.get(cv2.CAP_PROP_FOURCC)).to_bytes(4, "little").decode("ascii", "replace")
+        return f"{code} {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}"
+    except Exception:
+        return "?"
 
 SYSTEM_ID = 0xFF
 CMD_LEROBOT_MODE = 68
@@ -172,6 +196,64 @@ def remap_by_serial(cfg: dict) -> bool:
             cfg[f"{role}_port"] = port
             changed = True
     return changed
+
+
+def camera_identities() -> list[dict]:
+    """Every capture device, in the order OpenCV numbers them, with who it is.
+
+    [{"index": 1, "name": "icspring camera", "path": "\\?\\usb#vid_32e6&pid_9221..."}]
+
+    OpenCV opens a camera by its number in DirectShow's list, and that number is
+    not the camera: unplug one and every camera after it moves up a place. The
+    device path is the camera -- its USB product id, and the port it is in. Asked
+    of DirectShow directly, so the list is in the very order OpenCV counts.
+    Windows only; elsewhere, or without the comtypes package, an empty list,
+    and cameras are followed by number as before.
+    """
+    if not IS_WINDOWS:
+        return []
+    try:
+        import comtypes
+        from comtypes import GUID, client
+        from comtypes.persist import IPropertyBag
+        from pygrabber.dshow_core import ICreateDevEnum
+        from pygrabber.dshow_ids import DeviceCategories, clsids
+    except Exception:
+        return []
+    try:
+        comtypes.CoInitialize()           # once per thread; harmless if already done
+    except OSError:
+        pass
+    out = []
+    try:
+        sde = client.CreateObject(clsids.CLSID_SystemDeviceEnum, interface=ICreateDevEnum)
+        enum = sde.CreateClassEnumerator(GUID(DeviceCategories.VideoInputDevice), dwFlags=0)
+        moniker, count = enum.Next(1)
+        index = 0
+        while count > 0:
+            bag = moniker.BindToStorage(0, 0, IPropertyBag._iid_).QueryInterface(IPropertyBag)
+            try:
+                name = str(bag.Read("FriendlyName", pErrorLog=None))
+            except Exception:
+                name = ""
+            try:
+                path = str(bag.Read("DevicePath", pErrorLog=None)).lower()
+            except Exception:
+                path = ""                 # a virtual camera has none
+            out.append({"index": index, "name": name, "path": path})
+            index += 1
+            moniker, count = enum.Next(1)
+    except Exception:
+        return []
+    return out
+
+
+def usb_model(path: str) -> str | None:
+    """'vid_32e6&pid_9221' out of a device path: the model, wherever it is plugged."""
+    import re
+
+    m = re.search(r"vid_[0-9a-f]{4}&pid_[0-9a-f]{4}", path or "")
+    return m.group(0) if m else None
 
 
 def probe_cameras(limit: int = 6, log=print) -> list[int]:

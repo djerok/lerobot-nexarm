@@ -23,7 +23,20 @@
   }
   header {
     padding: 18px 26px; border-bottom: 1px solid var(--line);
-    display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap;
+    display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+    position: sticky; top: 0; z-index: 10; background: var(--bg);
+  }
+  /* Always on screen, never disabled, no "are you sure". */
+  button.estop {
+    margin-left: auto; background: #e1251b; color: #fff;
+    font-size: 26px; font-weight: 900; letter-spacing: .06em;
+    padding: 22px 40px; border-radius: 14px;
+    border: 4px solid #ffd400; box-shadow: 0 0 0 4px #e1251b;
+  }
+  button.estop:hover { filter: brightness(1.15); }
+  .estopNote {
+    background: #e1251b; color: #fff; font-weight: 800; font-size: 19px;
+    border-radius: 11px; padding: 16px 18px; margin-bottom: 18px;
   }
   h1 { margin: 0; font-size: 28px; letter-spacing: .2px; }
   .mode {
@@ -85,6 +98,21 @@
     background: #43201e; border: 1px solid #7d3530; color: #ffd9d6;
     border-radius: 11px; padding: 14px 16px; margin-bottom: 18px;
   }
+  .toast {
+    position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+    background: #2b3240; color: var(--ink); border: 1px solid #4a5568;
+    border-radius: 12px; padding: 14px 20px; font-size: 18px; font-weight: 600;
+    max-width: 760px; z-index: 20; box-shadow: 0 8px 30px rgba(0,0,0,.5);
+  }
+  .estopNote.pending { background: #ffd400; color: #111; }
+  .tryNow { font-size: 30px; font-weight: 800; margin: 6px 0; }
+  .labels { border-top: 1px solid var(--line); margin-top: 14px; padding-top: 6px; }
+  .labels h3 { margin: 10px 0 4px; font-size: 19px; }
+  .labels input[type=text] { max-width: 300px; }
+  .labels label[style] input[type=text] { max-width: 560px; }
+  table.tries { border-collapse: collapse; margin-top: 12px; font-size: 15px; }
+  table.tries td, table.tries th { border: 1px solid var(--line); padding: 5px 9px; text-align: left; }
+  table.tries tr.deleted td { color: #ff8a80; text-decoration: line-through; }
   .hide { display: none !important; }
 </style>
 
@@ -92,10 +120,12 @@
   <h1>Robot Station</h1>
   <span id="mode" class="mode">starting</span>
   <span id="ports" class="dim"></span>
+  <button class="estop" id="estopBtn" onclick="estop()">EMERGENCY STOP</button>
 </header>
 
 <main>
   <div id="err" class="err hide"></div>
+  <div id="estopNote" class="estopNote hide"></div>
 
   <!-- First time an arm is used on this computer: LeRobot's calibration asks -->
   <section id="promptCard" class="card hide">
@@ -129,10 +159,14 @@
   <section id="camCard" class="card hide">
     <h2>What the robot sees</h2>
     <div class="cams" id="cams"></div>
-    <p class="dim" id="camNote"></p>
-    <button class="quiet" id="swapBtn" onclick="post('/api/cameras/swap')">
-      Swap front and wrist
-    </button>
+    <p>
+      <label><span>Front camera</span><select id="camFront" onchange="setCams()"></select></label>
+      <label><span>Wrist camera</span><select id="camWrist" onchange="setCams()"></select></label>
+      <button class="quiet" id="rescanBtn" onclick="post('/api/cameras/rescan')">Look for cameras again</button>
+    </p>
+    <p class="dim">Pick the camera for each job. The front camera must see the table and the
+       arm -- not the room or the people in it. The number under each picture is how many
+       frames a second that camera is really giving.</p>
   </section>
 
   <!-- 3. Drive it -->
@@ -144,6 +178,12 @@
     </button>
     <button class="big quiet" id="stopBtn" onclick="post('/api/stop')">Stop</button>
     <p class="dim" id="teleopFps"></p>
+    <p><b>Start position:</b> <span id="startState">not set</span></p>
+    <p class="dim">While it is moving, hold the arm where every try should begin and press
+       the button. After each try -- saved or thrown away -- the robot goes back there,
+       slowly. Put the arm in your hand back there too.</p>
+    <button id="startSaveBtn" onclick="post('/api/start/save')">Save this spot as the start</button>
+    <button class="quiet" id="startClearBtn" onclick="post('/api/start/clear')">Clear it</button>
   </section>
 
 
@@ -169,13 +209,32 @@
     <p>
       <button class="big rec" id="recBtn" onclick="startRecord()">Start recording</button>
     </p>
+    <div id="swapNote" class="estopNote pending hide"></div>
     <div id="recLive" class="hide">
+      <p class="tryNow" id="tryNow"></p>
       <p><b id="recCount">Recording. Do the job now.</b></p>
       <p>
-        <button class="big go" onclick="post('/api/record/next')">Done, save this try</button>
-        <button class="quiet" onclick="post('/api/record/redo')">That went wrong, do it again</button>
-        <button class="rec" onclick="post('/api/stop')">Throw it away and stop</button>
+        <button class="big go" onclick="endTry('/api/record/next')">Done, save this try</button>
+        <button class="quiet" onclick="endTry('/api/record/redo')">That went wrong, mark it deleted</button>
+        <button class="rec" onclick="endTry('/api/stop')">Stop</button>
       </p>
+    </div>
+    <div class="labels">
+      <h3>Labels for this try <span class="dim">(saved with the try when it ends)</span></h3>
+      <p class="dim">Names: write them again every 10 tries, when you swap jobs.</p>
+      <label><span>Driver</span><input type="text" id="lb_driver" class="lb"></label>
+      <label><span>Recorder</span><input type="text" id="lb_recorder" class="lb"></label>
+      <label><span>Labeler</span><input type="text" id="lb_labeler" class="lb"></label>
+      <label style="display:block"><span>Where is the block? Describe it</span>
+        <input type="text" id="lb_position" class="lb" placeholder="e.g. front left, near the bowl"></label>
+      <label><span>Was there something wrong?</span>
+        <select id="lb_wrong" class="lb"><option value="">-</option><option>Yes</option><option>No</option></select></label>
+      <label><span>Type of try</span>
+        <select id="lb_type" class="lb"><option value="">-</option><option>Normal</option>
+          <option>Recovery</option><option>Other</option></select></label>
+      <label style="display:block"><span>Notes</span>
+        <input type="text" id="lb_notes" class="lb" placeholder="e.g. block slipped, camera froze"></label>
+      <table class="tries" id="recentTries"></table>
     </div>
   </section>
 
@@ -213,6 +272,7 @@
     <pre id="log"></pre>
   </section>
 </main>
+<div id="toast" class="toast hide"></div>
 
 <script>
 let state = null;
@@ -227,16 +287,54 @@ const busyNow = s => s.mode !== "idle";
 // Must match the slug built in hardware.py, so the page can find the job's folder.
 const slug = t => t.toLowerCase().replace(/[^a-z0-9]/g, "_").replace(/^_+|_+$/g, "").slice(0, 40);
 
+// A message at the bottom of the screen. Never alert(): a popup freezes the
+// whole page until someone clicks OK -- the EMERGENCY STOP button included.
+let toastTimer = null;
+function toast(msg) {
+  $("toast").textContent = msg;
+  $("toast").classList.remove("hide");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => $("toast").classList.add("hide"), 7000);
+}
+
 async function post(path, body) {
-  const r = await fetch(path, {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify(body || {})
-  });
-  const out = await r.json();
-  if (out && out.ok === false && out.why) alert(out.why);
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 10000);
+  let out = {};
+  try {
+    const r = await fetch(path, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body || {}),
+      signal: ctl.signal
+    });
+    out = await r.json();
+    if (out && out.ok === false && out.why) toast(out.why);
+  } catch {
+    toast("The station did not answer. Look at \"What just happened\" below.");
+  } finally {
+    clearTimeout(timer);
+  }
   refresh();
   return out;
+}
+
+// Straight to the station: no popup, no waiting on anything else the page does.
+// The page says so the instant it is pressed, and keeps trying if a request is lost.
+let estopPressed = 0;
+async function estop() {
+  estopPressed = Date.now();
+  $("estopNote").classList.remove("hide");
+  $("estopNote").classList.add("pending");
+  $("estopNote").textContent = "EMERGENCY STOP pressed. Switching every motor off...";
+  for (let i = 0; i < 5; i++) {
+    try {
+      const r = await fetch("/api/estop", {method: "POST", keepalive: true});
+      if (r.ok) break;
+    } catch {}
+    await new Promise(res => setTimeout(res, 200));
+  }
+  refresh();
 }
 
 async function startDetect() {
@@ -282,7 +380,7 @@ function fillEpisodes() {
 
 function startReplay() {
   const name = $("dsPick").value;
-  if (!name) { alert("Record something first."); return; }
+  if (!name) { toast("Record something first."); return; }
   if (!confirm("The arm will move on its own. Is everyone clear of it?")) return;
   post("/api/replay/start", {name: name, episode: +$("dsEp").value});
 }
@@ -303,21 +401,98 @@ function releaseMotors() {
   post("/api/release");
 }
 
-function startRecord() { post("/api/record/start", {task: $("task").value}); }
+// Labels go to the station as they are typed, and once more as the try ends.
+const LB = ["driver", "recorder", "labeler", "position", "wrong", "type", "notes"];
+let lbTimer = null;
+const lbTyped = {};          // field -> when it was last typed in, so a poll never undoes it
+function labelValues() {
+  const o = {};
+  for (const k of LB) o[k] = $("lb_" + k).value;
+  return o;
+}
+function sendLabels() {
+  return fetch("/api/labels", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(labelValues())}).catch(() => {});
+}
+for (const k of LB) $("lb_" + k).addEventListener("input", () => {
+  lbTyped[k] = Date.now();
+  clearTimeout(lbTimer); lbTimer = setTimeout(sendLabels, 300);
+});
+async function endTry(path) {
+  await sendLabels();
+  post(path);
+}
+const esc = t => String(t ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+let triesKey = "";
+function showLabels(s) {
+  for (const k of LB) {
+    const el = $("lb_" + k);
+    const typing = document.activeElement === el || Date.now() - (lbTyped[k] || 0) < 2000;
+    if (!typing && (s.labels || {})[k] !== undefined) el.value = s.labels[k];
+  }
+  const rows = s.recent_tries || [];
+  const key = JSON.stringify(rows);
+  if (key === triesKey) return;
+  triesKey = key;
+  $("recentTries").innerHTML = rows.length ? "<tr><th>Try</th><th>Kept?</th><th>Driver</th>" +
+    "<th>Where</th><th>Wrong?</th><th>Type</th><th>Notes</th></tr>" + rows.slice().reverse().map(r =>
+      `<tr class="${r.status === "deleted" ? "deleted" : ""}"><td>${esc(r.try)}</td>` +
+      `<td>${r.status === "deleted" ? "DELETED" : "kept"}</td><td>${esc(r.driver)}</td>` +
+      `<td>${esc(r.position)}</td><td>${esc(r.something_wrong)}</td><td>${esc(r.type)}</td>` +
+      `<td>${esc(r.notes)}</td></tr>`).join("") : "";
+}
 
-function buildCams(names) {
-  const key = names.join(",");
+function startRecord() {
+  sendLabels();
+  // Said the moment it is pressed, before the station has even answered.
+  $("recBtn").disabled = true;
+  $("recLive").classList.remove("hide");
+  $("recCount").textContent = "Getting the robot ready...";
+  post("/api/record/start", {task: $("task").value});
+}
+
+let camKey = "";
+function buildCamChoices(s) {
+  const roles = (s.config && s.config.cameras) || {};
+  const key = JSON.stringify([s.camera_choices, roles]);
+  const busyPick = [$("camFront"), $("camWrist")].includes(document.activeElement);
+  if (key === camKey || busyPick) return;   // never fight a dropdown that is in use
+  camKey = key;
+  const opts = '<option value="">None</option>' +
+    (s.camera_choices || []).map(i => `<option value="${i}">Camera ${i}</option>`).join("");
+  for (const [id, role] of [["camFront", "front"], ["camWrist", "wrist"]]) {
+    $(id).innerHTML = opts;
+    $(id).value = roles[role] === undefined ? "" : String(roles[role]);
+  }
+}
+
+function setCams() {
+  const v = id => $(id).value === "" ? null : +$(id).value;
+  camKey = "";                               // show what the station accepted
+  post("/api/cameras/set", {front: v("camFront"), wrist: v("camWrist")});
+}
+
+function buildCams(names, port) {
+  const key = names.join(",") + "@" + port;
   if (key === streamsFor) return;          // never rebuild a live <img>, it restarts the stream
   streamsFor = key;
+  // Close the old pictures' connections before making new ones. A removed
+  // <img> can keep its stream open, and those used to pile up.
+  for (const img of $("cams").querySelectorAll("img")) img.src = "";
+  // From the second server, so the pictures never queue up the buttons.
+  const base = port ? `${location.protocol}//${location.hostname}:${port}` : "";
   $("cams").innerHTML = names.map(n =>
-    `<figure><img src="/stream/${n}" alt="${n} camera"><figcaption>${n}</figcaption></figure>`
+    `<figure><img src="${base}/stream/${n}" alt="${n} camera"><figcaption id="cap_${n}">${n}</figcaption></figure>`
   ).join("");
 }
 
 async function refresh() {
   let s;
-  try { s = await (await fetch("/api/state")).json(); }
-  catch { return; }                        // server shutting down; the page can wait
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 2500);
+  try { s = await (await fetch("/api/state", {signal: ctl.signal})).json(); }
+  catch { return; }                        // slow or shutting down; the next poll tries again
+  finally { clearTimeout(timer); }
   state = s;
 
   $("mode").textContent = s.mode === "idle" ? "ready" : s.mode;
@@ -331,6 +506,15 @@ async function refresh() {
   $("promptCard").classList.toggle("hide", !s.prompt);
   $("promptText").textContent = s.prompt || "";
 
+  const justPressed = Date.now() - estopPressed < 1500 && !s.estop_at;
+  if (!justPressed) {
+    $("estopNote").classList.toggle("hide", !s.estop_at);
+    $("estopNote").classList.toggle("pending", !!s.estop_at && s.estop_busy);
+    if (s.estop_at) $("estopNote").textContent = s.estop_busy
+      ? `EMERGENCY STOP at ${s.estop_at}. Switching the motors off and stopping everything...`
+      : `EMERGENCY STOP at ${s.estop_at}. The motors are off and the arms are floppy, and the try ` +
+        "was thrown away. Put the arm somewhere safe by hand, then press Start to carry on.";
+  }
   $("err").classList.toggle("hide", !s.error);
   if (s.error) $("err").textContent = s.error;
 
@@ -342,7 +526,7 @@ async function refresh() {
   $("setupIdle").classList.toggle("hide", dragging);
   $("setupDrag").classList.toggle("hide", !dragging);
 
-  $("camCard").classList.toggle("hide", !ready || !s.cameras.length);
+  $("camCard").classList.toggle("hide", !ready);
   $("driveCard").classList.toggle("hide", !ready);
   $("recCard").classList.toggle("hide", !ready);
   $("replayCard").classList.toggle("hide", !ready);
@@ -352,12 +536,15 @@ async function refresh() {
   buildDatasets(s.datasets || []);
   $("releaseBtn").disabled = busyNow(s);
 
-  if (ready && s.cameras.length) {
-    buildCams(s.cameras);
-    $("swapBtn").classList.toggle("hide", s.cameras.length < 2);
-    $("camNote").textContent = s.cameras.length < 2
-      ? "Only one camera found. That is fine, the arm still works."
-      : "If these two are the wrong way round, press the button.";
+  if (ready) {
+    buildCams(s.cameras, s.stream_port);
+    buildCamChoices(s);
+    for (const n of s.cameras) {
+      const f = (s.camera_fps || {})[n];
+      if ($("cap_" + n)) $("cap_" + n).textContent = f ? `${n} - ${f} fps` : n;
+    }
+    const camsBusy = s.mode !== "idle" && s.mode !== "teleop";
+    $("camFront").disabled = $("camWrist").disabled = $("rescanBtn").disabled = camsBusy;
   }
 
   const busy = s.mode !== "idle";
@@ -367,23 +554,49 @@ async function refresh() {
   $("stopBtn").disabled = !busy;
   $("teleopFps").textContent =
     s.mode === "teleop" ? `running at ${s.status.fps} steps a second` : "";
+  $("startState").textContent = s.start_saved ? "saved" : "not set";
+  $("startSaveBtn").disabled = s.mode !== "teleop";
+  $("startClearBtn").disabled = !s.start_saved || busy;
 
   const rec = s.mode === "record";
   $("recLive").classList.toggle("hide", !rec || !!s.prompt);
+  showLabels(s);
+  // Which try this is, as it will be numbered in the dataset and on the sheet.
+  const st = s.status || {};
+  const tn = st.try_no;
+  $("tryNow").textContent = rec && tn !== undefined ? `Try ${tn + 1}  -  ${st.job || ""}` : "";
+  const every = s.swap_every || 10;
+  const last = (s.recent_tries || []).slice(-1)[0];
+  const done = last ? +last.try : 0;
+  const swap = done > 0 && done % every === 0 && !rec;
+  $("swapNote").classList.toggle("hide", !swap);
+  if (swap) $("swapNote").textContent =
+    `${done} tries done: SWAP JOBS now, then write the new names below.`;
   if (rec) {
     // Must match the folder name built in hardware.py: robot kind, then the job.
     const prefix = (c.robot_type || "nexarm") + "_";
     const job = (s.datasets || []).find(d => prefix + slug($("task").value) === d.name);
     const have = job ? job.episodes : 0;
-    $("recCount").textContent = have
-      ? `Recording. This job already has ${have} saved ${have === 1 ? "try" : "tries"}.`
-      : "Recording. Do the job now, then press Done.";
+    // Before the try starts, the robot is walked over to the arm you hold.
+    // Moving then would leave it behind, so the page says to wait.
+    $("recCount").textContent = s.status.phase === "returning"
+      ? "Going back to the start position..."
+      : s.status.phase !== "recording"
+      ? "Getting the robot ready..."
+      : have
+        ? `Recording. This job already has ${have} saved ${have === 1 ? "try" : "tries"}.`
+        : "Recording. Do the job now, then press Done.";
   }
 
   $("log").textContent = (s.log || []).join("\n");
   $("log").scrollTop = $("log").scrollHeight;
 }
 
-refresh();
-setInterval(refresh, 700);
+// One question at a time: the next only after the last has an answer. With a
+// fixed timer, slow answers piled up and filled the browser's connections.
+async function poll() {
+  await refresh();
+  setTimeout(poll, 500);
+}
+poll();
 </script>

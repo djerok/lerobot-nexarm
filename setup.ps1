@@ -83,7 +83,8 @@ Write-Host "      adding support for SO-101, Koch and OpenManipulator arms..." -
 & $uv.Source pip install --python $py `
     "feetech-servo-sdk>=1.0.0,<2.0.0" `
     "dynamixel-sdk>=3.7.31,<3.9.0" `
-    "deepdiff>=7.0.1,<9.0.0"
+    "deepdiff>=7.0.1,<9.0.0" `
+    "pygrabber>=0.2,<1"
 
 & $py -c "import lerobot, serial, cv2; from lerobot.scripts import lerobot_record, lerobot_replay; print('imports OK')"
 if ($LASTEXITCODE -ne 0) {

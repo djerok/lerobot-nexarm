@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -20,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from station import detect, server                     # noqa: E402
+from station import hardware                           # noqa: E402
 from station.hardware import Station                   # noqa: E402
 
 PASS, FAIL = [], []
@@ -188,6 +190,8 @@ def main() -> int:
         check("serves the page", code == 200 and b"Robot Station" in body, ctype)
         check("the page has the robot picker and the calibration Next button",
               b'id="kindPick"' in body and b'id="promptCard"' in body)
+        check("the page has a camera dropdown for front and for wrist",
+              b'id="camFront"' in body and b'id="camWrist"' in body)
         state = json.loads(get(base + "/api/state")[2])
         check("/api/state has the fields the page reads",
               {"mode", "setup_stage", "config_ok", "cameras", "status", "log",
@@ -203,14 +207,29 @@ def main() -> int:
             check("single still works", code == 200 and ctype == "image/jpeg" and len(body) > 1000,
                   f"{len(body)} bytes")
 
-            # MJPEG has no end, so read a fixed slice and count boundaries.
-            with urllib.request.urlopen(f"{base}/stream/{names[0]}", timeout=6) as r:
+            # MJPEG has no end, so read for a while and count boundaries. Only
+            # pictures that changed are sent, so a camera behind a privacy
+            # shutter sends one frame and then nothing -- that is reported,
+            # not failed: the station is right to treat it as frozen.
+            chunk = b""
+            with urllib.request.urlopen(f"{base}/stream/{names[0]}", timeout=2) as r:
                 ctype = r.headers.get("Content-Type", "")
-                chunk = r.read(200_000)
+                deadline = time.time() + 6
+                while len(chunk) < 200_000 and time.time() < deadline:
+                    try:
+                        piece = r.read1(65536)
+                    except TimeoutError:
+                        break
+                    if not piece:
+                        break
+                    chunk += piece
+            frames = chunk.count(b"--" + server.BOUNDARY.encode())
             check("stream is multipart", "multipart/x-mixed-replace" in ctype, ctype)
-            check("stream carries several frames",
-                  chunk.count(b"--" + server.BOUNDARY.encode()) >= 2,
-                  f"{chunk.count(b'--' + server.BOUNDARY.encode())} frames")
+            if frames < 2 and not st.camera_fps.get(names[0]):
+                print(f"  [--] stream frames not checked: camera {names[0]} gives an unchanging "
+                      f"picture (privacy shutter or lens cover?)")
+            else:
+                check("stream carries several frames", frames >= 2, f"{frames} frames")
 
         check("unknown path is a 404",
               _status_of(base + "/api/nope") == 404)
@@ -228,9 +247,13 @@ def main() -> int:
         r = post(base + "/api/record/next")
         check("next-try button sets exit_early", st.events["exit_early"] is True)
         st.events["exit_early"] = False
+        st.mode = "record"
         post(base + "/api/record/redo")
-        check("redo button sets rerecord", st.events["rerecord_episode"] is True)
-        st.events["rerecord_episode"] = False
+        st.mode = "idle"
+        check("'That went wrong' button ends the try and marks it deleted",
+              st.events["exit_early"] is True and st._deleted is True)
+        st.events.update(exit_early=False, rerecord_episode=False, stop_recording=False)
+        st._deleted = False
 
         bad = Station()
         bad.cfg = {"leader_port": "COM999", "follower_port": "COM998"}
@@ -814,6 +837,238 @@ def any_kind_of_arm(st_cfg: dict) -> None:
     stopper.mode = "idle"
     check("Stop ends a calibration that is waiting on Next", out == ["cancelled"], str(out))
 
+    # -- record and replay: the first move glides from where the arm is, never jumps
+    class _Arm:
+        def __init__(self, pose):
+            self.pose = pose
+
+        def get_observation(self):
+            if self.pose is None:
+                raise OSError("no reply from the arm")
+            return dict(self.pose)
+
+    def glide(station, start, target, ticks=400):
+        station._last_sent, station._catching_up = {}, False
+        station._seed_from_arm(_Arm(start), target)
+        seen, prev = [], dict(start)
+        for _ in range(ticks):
+            out = station._glide_in(target)
+            seen.append(max(abs(out[k] - prev[k]) for k in out))
+            prev = out
+            if out == target:
+                break
+        return seen, prev
+
+    nexa = Station()
+    nexa.cfg = dict(st_cfg)
+    nexa._limits = None
+    j = "shoulder_pan.pos"
+    steps, end = glide(nexa, {j: 2000.0}, {j: 3000.0})
+    check("NexArm: the first move of a recording or replay is a small step, not the whole gap",
+          steps[0] <= 12, f"first step {steps[0]:.0f} counts (was 1000: straight to the target)")
+    check("NexArm: it glides the whole way, no jump at the end, and arrives",
+          end == {j: 3000.0} and max(steps) <= 24,
+          f"{len(steps)} ticks, biggest {max(steps):.0f}")
+    so_steps, so_end = glide(so, {"shoulder_pan.pos": 0.0}, {"shoulder_pan.pos": 90.0})
+    check("SO-101: the same glide in degrees, about one a tick",
+          so_steps[0] <= 1.0 and so_end == {"shoulder_pan.pos": 90.0}, f"{len(so_steps)} ticks")
+    nexa._last_sent, nexa._catching_up = {}, False
+    nexa._seed_from_arm(_Arm(None), {j: 3000.0})
+    check("an arm that cannot be read is not guessed at",
+          nexa._last_sent == {} and nexa._catching_up is False)
+
+    class _Leader:
+        def __init__(self, pose):
+            self.pose = pose
+
+        def get_action(self):
+            return dict(self.pose)
+
+    class _Follower:
+        def __init__(self, pose):
+            self.pose, self.sent = pose, []
+
+        def get_observation(self):
+            return dict(self.pose)
+
+        def send_action(self, action):
+            self.sent.append(dict(action))
+            return action
+
+    f = _Follower({j: 2000.0})
+    check("before a try, arms that already match are not walked at all",
+          nexa._first_sync(f, _Leader({j: 2020.0}), 30, quick_if_matched=True) is True
+          and f.sent == [] and nexa._last_sent == {j: 2000.0})
+    nexa._cancel.set()
+    f2 = _Follower({j: 2000.0})
+    check("Stop pressed while it is lining up ends it, nothing more is sent",
+          nexa._first_sync(f2, _Leader({j: 3500.0}), 30, quick_if_matched=True) is False
+          and f2.sent == [])
+    nexa._cancel.clear()
+
+    # -- start position: saved while moving, gone back to slowly after a try
+    joints = [f"{n}.pos" for n in ("shoulder_pan", "shoulder_lift", "elbow_flex",
+                                   "wrist_flex", "wrist_roll", "gripper")]
+    sp = Station()
+    sp.cfg = dict(st_cfg)
+    check("a start position cannot be saved while the arm is not moving",
+          sp.save_start_position().get("ok") is False)
+    sp.mode, sp._synced = "teleop", False
+    check("...nor during the opening sync", sp.save_start_position().get("ok") is False)
+    sp._synced = True
+    sp._last_sent = {k: 2000.0 + i for i, k in enumerate(joints)}
+    check("while moving, it saves where the arm is, for this kind of robot",
+          sp.save_start_position().get("ok") is True
+          and sp.cfg.get("reset_robot") == "nexarm" and sp._start_pose() == sp._last_sent)
+    check("the page is told a start position is saved", sp.snapshot()["start_saved"] is True)
+    sp.mode = "idle"
+    cfg_rec = sp.record_config("x")
+    check("with a start position, the arm keeps holding at the end of a try (no drop)",
+          cfg_rec is not None and cfg_rec.robot.disable_torque_on_disconnect is False)
+    other = dict(sp.cfg, reset_robot="so101")
+    sp_other = Station()
+    sp_other.cfg = other
+    check("a start position saved on another kind of robot is ignored",
+          sp_other._start_pose() is None)
+
+    class _HoldFollower:
+        def __init__(self, pose):
+            self.pose, self.sent, self.on = pose, [], False
+            self.config = types.SimpleNamespace(disable_torque_on_disconnect=True)
+
+        def connect(self, calibrate=True):
+            self.on = True
+
+        def get_observation(self):
+            return dict(self.pose)
+
+        def send_action(self, action):
+            self.sent.append(dict(action))
+            return action
+
+        def disconnect(self):
+            self.on = False
+
+    class _LeaderBus:
+        """A NexArm leader board: positions in, positions out, torque switch."""
+        def __init__(self, pos):
+            self.pos, self.torque, self.writes, self.closed = list(pos), False, [], False
+
+        def read_positions(self):
+            return list(self.pos)
+
+        def write_positions(self, positions):
+            self.writes.append(list(positions))
+
+        def set_torque(self, on):
+            self.torque = on
+
+        def disconnect(self):
+            self.closed = True
+
+    class _FakeLeader:
+        def __init__(self, pos):
+            self.bus = _LeaderBus(pos)
+
+        def connect(self, calibrate=True):
+            self.bus.torque = False          # every leader comes up loose
+
+        def disconnect(self):
+            self.bus.disconnect()
+
+    home = sp._start_pose()
+    fake = _HoldFollower({k: v + 500.0 for k, v in home.items()})
+    fake_leader = _FakeLeader([1000] * 6)
+    real_make, real_make_leader = sp._make_follower, sp._make_leader
+    sp._make_follower = lambda cameras=None: fake
+    sp._make_leader = lambda: fake_leader           # never the real leader on a real port
+    try:
+        sp._return_to_start(30)
+    finally:
+        sp._make_follower, sp._make_leader = real_make, real_make_leader
+    biggest = max((max(abs(b[k] - a[k]) for k in a)
+                   for a, b in zip([fake.pose] + fake.sent, fake.sent)), default=0)
+    check("after a try it glides back to the start position, slowly",
+          bool(fake.sent) and all(abs(fake.sent[-1][k] - home[k]) <= 2 for k in home)
+          and biggest <= 24, f"{len(fake.sent)} ticks, biggest {biggest:.0f} counts")
+    check("...and is let go of still holding there", fake.config.disable_torque_on_disconnect is False)
+    want = robots.nexarm_follower_to_leader(home)
+    lw = fake_leader.bus.writes
+    lead_big = max((max(abs(b[i] - a[i]) for i in range(6)) for a, b in zip(lw, lw[1:])), default=0)
+    check("the arm in the child's hand goes back to the start too, slowly",
+          bool(lw) and all(abs(lw[-1][i] - want[f"{n}.pos"]) <= 2
+                           for i, n in enumerate(robots.NEXARM_JOINTS)) and lead_big <= 24,
+          f"{len(lw)} ticks, ends {lw[-1] if lw else None}")
+    check("...its motors were switched on holding where it was, and stay on at the start",
+          lw and lw[0] == [1000] * 6 and fake_leader.bus.torque is True and fake_leader.bus.closed)
+    fast = Station()
+    fast.cfg = dict(st_cfg)
+    fast._limits = None
+    f3 = _HoldFollower({"shoulder_pan.pos": 2000.0})
+    t0 = time.monotonic()
+
+    class _At:
+        def get_action(self):
+            return {"shoulder_pan.pos": 2060.0}
+
+    fast._first_sync(f3, _At(), 30, quick_if_matched=True)
+    took = time.monotonic() - t0
+    check("arms that nearly match line up in well under a second (it used to take 2 s)",
+          took < 0.8, f"{took:.2f} s for a 60-count gap")
+    wcam = Station()
+    wcam.cfg = dict(st_cfg, cameras={"front": 0, "wrist": 1})
+    wrec = wcam.record_config("x")
+    check("record() encodes video while recording, so Done does not wait for it",
+          wrec is not None and wrec.dataset.streaming_encoding is True)
+    check("record() is configured with both cameras, at 640x480",
+          wrec is not None and len(wrec.robot.cameras) == 2
+          and all((c.width, c.height) == (640, 480) for c in wrec.robot.cameras.values()))
+    import numpy as np
+    sc = Station()
+    sc._publish_bgr("front", np.full((240, 320, 3), (10, 20, 30), dtype=np.uint8))
+    shim = hardware._StationCamera(sc, "front", 640, 480)
+    shim.connect()
+    img = shim.read_latest()
+    check("record() reads the station's own camera: RGB, at the dataset's size",
+          img.shape == (480, 640, 3) and tuple(img[0, 0]) == (30, 20, 10) and shim.is_connected,
+          str(img.shape))
+    blank = hardware._StationCamera(sc, "wrist", 640, 480).async_read()
+    check("...and a camera with no picture gives a black frame instead of ending the try",
+          blank.shape == (480, 640, 3) and not blank.any())
+    check("clearing the start position works",
+          sp.clear_start_position().get("ok") is True and sp._start_pose() is None
+          and sp.record_config("x").robot.disable_torque_on_disconnect is True)
+
+    tr = Station()
+    check("'That went wrong' does nothing when nothing is recording",
+          tr.throw_away_try().get("ok") is False)
+    tr.mode = "record"
+    tr.throw_away_try()
+    check("'That went wrong' keeps the try (so the numbers match the sheet), marked deleted",
+          tr.events == {"exit_early": True, "rerecord_episode": False, "stop_recording": False}
+          and tr._deleted)
+    tr2 = Station()
+    tr2.mode = "record"
+    tr2.stop()
+    check("Stop during a try keeps it, marked deleted",
+          tr2.events["exit_early"] is True and tr2._deleted is True)
+    with tempfile.TemporaryDirectory() as tmp:
+        lb = Station()
+        root = Path(tmp)
+        lb.set_labels({"driver": "Ann", "position": "front left", "wrong": "No",
+                       "type": "Normal", "notes": "ok"})
+        lb._write_label(root, 0, "pick block")
+        lb._deleted = True
+        lb._write_label(root, 1, "pick block")
+        lb._labels_root = root
+        rows = lb.recent_labels()
+        check("labels.csv gets one line per try, kept and deleted, numbered like the dataset",
+              [(r["try"], r["episode"], r["status"]) for r in rows]
+              == [("1", "0", "kept"), ("2", "1", "deleted")]
+              and rows[0]["position"] == "front left" and rows[0]["driver"] == "Ann", str(rows))
+        check("...the per-try answers start blank again, the names stay",
+              rows[1]["something_wrong"] == "" and rows[1]["driver"] == "Ann")
+
     # -- a recording is only replayed on the kind of arm that made it
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp) / "koch_wave"
@@ -826,6 +1081,398 @@ def any_kind_of_arm(st_cfg: dict) -> None:
             json.dumps({"total_episodes": 1, "robot_type": "so_follower"}), encoding="utf-8")
         check("an SO-101 recording is replayed on an SO-101",
               so._recorded_on_other_kind(root) is None)
+
+    # -- cameras: any camera in either slot, and each picture at its own camera's speed
+    import numpy as np
+
+    cam = Station()
+    cam.cfg = dict(st_cfg, cameras={"front": 0, "wrist": 1})
+    cam.cameras_found = [0, 1, 2]
+    reopened = []
+    cam.open_cameras = lambda rescanned=False: reopened.append(dict(cam.cfg["cameras"]))
+    r = cam.set_cameras(2, 1)
+    check("a third camera can be chosen for the front",
+          r.get("ok") is True and cam.cfg["cameras"] == {"front": 2, "wrist": 1} and reopened,
+          str(cam.cfg["cameras"]))
+    check("the same camera cannot fill both slots", cam.set_cameras(1, 1).get("ok") is False)
+    check("a camera that was never found is refused", cam.set_cameras(7, None).get("ok") is False)
+    check("the laptop webcam can be left out: one camera, as the front one",
+          cam.set_cameras(None, 2).get("ok") is True and cam.cfg["cameras"] == {"front": 2})
+    check("no camera at all is allowed", cam.set_cameras(None, None).get("ok") is True
+          and cam.cfg["cameras"] == {})
+    cam.mode = "record"
+    check("cameras cannot be changed in the middle of a try", cam.set_cameras(0, 1).get("ok") is False)
+    cam.mode = "idle"
+    check("the page is given every camera to choose from", cam.camera_choices() == [0, 1, 2])
+
+    class _Cap:
+        """A camera that makes a frame every `period` seconds."""
+        def __init__(self, period):
+            self.period, self.open = period, True
+
+        def isOpened(self):
+            return self.open
+
+        def set(self, *a):
+            return True
+
+        def read(self):
+            time.sleep(self.period)
+            self.n = getattr(self, "n", 0) + 1     # a real camera never repeats a frame
+            return True, np.full((48, 64, 3), self.n % 250, dtype=np.uint8)
+
+        def release(self):
+            self.open = False
+
+    real_open_capture = detect.open_capture
+    speeds = {0: 1 / 30, 1: 1 / 10}
+    detect.open_capture = lambda idx: _Cap(speeds[int(idx)])
+    two = Station()
+    two.cfg = dict(st_cfg, cameras={"front": 0, "wrist": 1})
+    try:
+        two.open_cameras(rescanned=True)
+        time.sleep(2.5)
+        fps = dict(two.camera_fps)
+    finally:
+        two.close_cameras()
+        detect.open_capture = real_open_capture
+    check("a slow camera no longer slows the other one down",
+          fps.get("front", 0) >= 24 and 7 <= fps.get("wrist", 0) <= 11,
+          f"front {fps.get('front')} fps (camera makes 30), wrist {fps.get('wrist')} fps (makes 10)")
+    check("closing the cameras leaves teleop's stop signal alone", not two._stop.is_set())
+
+    from station.hardware import CAMERA_FROZEN_SECONDS
+
+    class _FreezingCap(_Cap):
+        """Changing frames for a while, then the same frame forever: a frozen camera."""
+        def __init__(self, good):
+            super().__init__(1 / 30)
+            self.good = good
+
+        def read(self):
+            time.sleep(self.period)
+            self.n = getattr(self, "n", 0) + 1
+            return True, np.full((48, 64, 3), min(self.n, self.good) % 250, dtype=np.uint8)
+
+    opened = []
+
+    def fake_open(idx):
+        c = _FreezingCap(good=10) if not opened else _Cap(1 / 30)
+        opened.append(c)
+        return c
+
+    detect.open_capture = fake_open
+    fr = Station()
+    fr.cfg = dict(st_cfg, cameras={"front": 0})
+    try:
+        fr.open_cameras(rescanned=True)
+        time.sleep(CAMERA_FROZEN_SECONDS + 2.5)
+        seq_then = fr._frame_seq.get("front", 0)
+        time.sleep(0.5)
+        resumed = fr._frame_seq.get("front", 0) > seq_then
+    finally:
+        fr.close_cameras()
+        detect.open_capture = real_open_capture
+    check("a camera that freezes is noticed and restarted by itself",
+          len(opened) >= 2 and resumed, f"opened {len(opened)} times, frames flowing again: {resumed}")
+
+    tok = Station()
+    tok.cfg = dict(st_cfg, cameras={"front": 0})
+    detect.open_capture = lambda idx: _Cap(1 / 30)
+    try:
+        tok.open_cameras(rescanned=True)
+        old_stop, readers = tok._pump_stop, list(tok._pump_threads)
+        tok.close_cameras()
+    finally:
+        detect.open_capture = real_open_capture
+    check("closing the cameras stops their readers for good (none can come back)",
+          old_stop.is_set() and not any(t.is_alive() for t in readers))
+
+    class _Busy(_Cap):
+        def isOpened(self):
+            return False
+
+    ch = Station()
+    ch.cfg = dict(st_cfg, cameras={"front": 1, "wrist": 2}, cameras_chosen=True)
+    real_probe = detect.probe_cameras
+    detect.open_capture = lambda idx: _Busy(1)
+    detect.probe_cameras = lambda **k: [0]          # only the laptop webcam is free
+    try:
+        ch.open_cameras()
+    finally:
+        detect.open_capture = real_open_capture
+        detect.probe_cameras = real_probe
+    check("a camera you chose is never swapped for a guess just because it is busy",
+          ch.cfg["cameras"] == {"front": 1, "wrist": 2}, str(ch.cfg["cameras"]))
+
+    # -- unplug and replug: each slot follows its own camera, never a stranger
+    P_WEB = "\\\\?\\usb#vid_5986&pid_11ad&mi_00#6&6a0accc&1&0000#{x}\\global"
+    P_FRONT = "\\\\?\\usb#vid_32e6&pid_9221&mi_00#7&7551382&0&0000#{x}\\global"
+    P_WRIST = "\\\\?\\usb#vid_32e6&pid_9005&mi_00#7&23fc3727&0&0000#{x}\\global"
+    P_FRONT_OTHER_PORT = "\\\\?\\usb#vid_32e6&pid_9221&mi_00#7&deadbee&0&0000#{x}\\global"
+    present = []
+    real_ids = detect.camera_identities
+    detect.camera_identities = lambda: [{"index": i, "name": "cam", "path": p}
+                                         for i, p in enumerate(present)]
+    try:
+        idc = Station()
+        idc.cfg = dict(st_cfg, cameras={"front": 1, "wrist": 2})
+        present[:] = [P_WEB, P_FRONT, P_WRIST]
+        idc._remember_camera_ids()
+        check("each slot remembers which physical camera it holds",
+              idc.cfg["camera_ids"] == {"front": P_FRONT.lower(), "wrist": P_WRIST.lower()}
+              or idc.cfg["camera_ids"] == {"front": P_FRONT, "wrist": P_WRIST})
+        idc.cfg["camera_ids"] = {"front": P_FRONT, "wrist": P_WRIST}
+        present[:] = [P_WEB, P_WRIST]                 # front unplugged: wrist slides to 1
+        where = idc._resolve_cameras()
+        check("front unplugged: front waits, and the wrist camera is followed to its new number",
+              where == {"front": None, "wrist": 1} and idc.cfg["cameras"]["wrist"] == 1, str(where))
+        check("...so nothing ever shows the wrist picture in the front slot", where["front"] is None)
+        present[:] = [P_WEB, P_FRONT, P_WRIST]        # plugged back into the same port
+        where = idc._resolve_cameras()
+        check("plugged back in: both slots find their own camera again",
+              where == {"front": 1, "wrist": 2}, str(where))
+        present[:] = [P_WEB, P_WRIST, P_FRONT_OTHER_PORT]   # front moved to another port
+        where = idc._resolve_cameras()
+        check("plugged into a different port: recognised by its model, back in its slot",
+              where == {"front": 2, "wrist": 1}, str(where))
+        idc.mode = "idle"
+        idc.usable = lambda: (True, "")           # this check is about cameras, not ports
+        idc._camera_missing["front"] = True
+        r = idc.start_record("x")
+        check("recording will not start while a chosen camera is unplugged",
+              r.get("ok") is False and "no picture" in r.get("why", ""), r.get("why", ""))
+    finally:
+        detect.camera_identities = real_ids
+
+    # -- gripper guard: a jaw resting still is not a stalled jaw
+    rg = Station()
+    rg.cfg, rg._limits, rg._grip = dict(st_cfg), None, {}
+    G1 = "gripper.pos"
+    for _ in range(20):                                # closed and resting on its target
+        rg._guard_gripper({G1: 1195.0}, {G1: 1210.0})
+    first = [rg._guard_gripper({G1: 2833.0}, {G1: 1210.0 + 3 * i})[G1] for i in range(4)]
+    check("a jaw resting closed opens when the trigger lets go (it used to stay pinned shut)",
+          first == [2833.0] * 4, str(first))
+    blocked = [rg._guard_gripper({G1: 1195.0}, {G1: 1800.0})[G1] for _ in range(12)]
+    check("...and a jaw blocked by a block is still eased off after a moment",
+          blocked[-1] == 1800.0 - hardware.GRIP_SQUEEZE, str(blocked[-3:]))
+
+    # -- gripper guard: sensor jitter does not make it let go and strain again
+    jg = Station()
+    jg.cfg, jg._limits, jg._grip = dict(st_cfg), None, {}
+    G2 = "gripper.pos"
+    T = hardware.GRIP_STALL_TICKS
+    jitter = [2753.0, 2758.0, 2752.0, 2757.0, 2753.0, 2759.0, 2754.0, 2756.0] * 3
+    outs = [jg._guard_gripper({G2: 2833.0}, {G2: a})[G2] for a in jitter]
+    check("gripper jitter does not make the guard let go (it used to strain again each time)",
+          outs[T - 1:] == [outs[T - 1]] * (len(outs) - T + 1) and outs[T - 1] < 2800,
+          str(outs[T - 2:T + 4]))
+
+    w = Station()
+    seq0 = w._frame_seq.get("front", 0)
+    got = []
+    threading.Thread(target=lambda: got.append(w.wait_frame("front", seq0, timeout=2.0)),
+                     daemon=True).start()
+    time.sleep(0.2)
+    w._publish_bgr("front", np.zeros((48, 64, 3), dtype=np.uint8))
+    time.sleep(0.2)
+    check("a waiting video stream gets each new frame the moment it exists",
+          bool(got) and got[0][0] is not None and got[0][0][:2] == b"\xff\xd8")
+    check("...and a stream with no new frame times out cleanly",
+          w.wait_frame("nothing", 0, timeout=0.2) == (None, 0))
+
+    # -- EMERGENCY STOP
+    class _NexBus:
+        def __init__(self):
+            self.torque = True
+            self.log = []
+
+        def set_torque(self, on):
+            self.torque = on
+            self.log.append(("torque", on))
+
+        def read_positions(self):
+            return [2000] * 6
+
+        def write_positions(self, positions):
+            self.log.append(("write", tuple(positions)))
+
+    class _LeBus2:
+        def __init__(self):
+            self.off = False
+
+        def disable_torque(self, motors=None, num_retry=0):
+            self.off = True
+
+    nex_dev = types.SimpleNamespace(bus=_NexBus(),
+                                    config=types.SimpleNamespace(disable_torque_on_disconnect=True))
+    robots.torque_off(nex_dev)
+    check("E-STOP: a NexArm's motors go off at once",
+          nex_dev.bus.torque is False and nex_dev.config.disable_torque_on_disconnect is False,
+          "and its disconnect will not re-hold for 0.4 s")
+    le_dev = types.SimpleNamespace(bus=_LeBus2(),
+                                   config=types.SimpleNamespace(disable_torque_on_disconnect=True))
+    robots.torque_off(le_dev)
+    check("E-STOP: a LeRobot arm's motors go off at once", le_dev.bus.off is True)
+
+    released = []
+    real_release = robots.release
+    robots.release = lambda kind, port, role="follower": released.append((port, role)) or True
+    try:
+        # Made-up ports, always: the backstop runs on its own thread and must
+        # never reach a real arm, even if it outlives the stand-in release.
+        fake_ports = {"leader_port": "COM901", "follower_port": "COM902"}
+        es = Station()
+        es.cfg = dict(st_cfg, **fake_ports)
+        held = threading.Event()
+
+        def hog():                      # something else holding the station's lock
+            with es.lock:
+                held.set()
+                time.sleep(1.5)
+
+        threading.Thread(target=hog, daemon=True).start()
+        held.wait(2)
+        t0 = time.monotonic()
+        r = es.emergency_stop()
+        took = time.monotonic() - t0
+        check("E-STOP answers at once, even while the station is busy with something else",
+              r.get("ok") is True and took < 0.2, f"{took * 1000:.0f} ms")
+        deadline = time.time() + 5
+        while es._estop_busy and time.time() < deadline:
+            time.sleep(0.05)
+        check("E-STOP: once nothing holds them, both arms are switched off",
+              sorted(set(released)) == [("COM901", "leader"), ("COM902", "follower")],
+              str(released))
+        check("E-STOP: the page is told, with the time", bool(es.snapshot()["estop_at"]))
+        es._estop_busy = True
+        check("nothing can start while the motors are still being switched off",
+              es.start_teleop().get("ok") is False)
+        es._estop_busy = False
+
+        er = Station()
+        er.cfg = dict(st_cfg, **fake_ports)
+        er.mode = "record"
+        er.emergency_stop()
+        check("E-STOP during a try marks it deleted and skips going back to start",
+              er._deleted and er.events["exit_early"] and er._cancel.is_set())
+        er.mode = "idle"                # lets its backstop finish, on the stand-in
+        deadline = time.time() + 5
+        while er._estop_busy and time.time() < deadline:
+            time.sleep(0.05)
+
+        # The off command goes out at once through the open connection -- not on
+        # the worker's next move, which a recording never made (6 s powered).
+        lv = Station()
+        lv.cfg = dict(st_cfg, **fake_ports)
+        lv.mode = "record"
+        live_bus = _NexBus()
+        lv._live["follower"] = types.SimpleNamespace(
+            bus=live_bus, config=types.SimpleNamespace(disable_torque_on_disconnect=True))
+        t0 = time.monotonic()
+        lv.emergency_stop()
+        while live_bus.torque and time.monotonic() - t0 < 2:
+            time.sleep(0.005)
+        took = time.monotonic() - t0
+        check("E-STOP switches the motors off at once through the open connection",
+              live_bus.torque is False and took < 0.2, f"{took * 1000:.0f} ms")
+        lv._live.clear()
+        lv.mode = "idle"
+        deadline = time.time() + 5
+        while lv._estop_busy and time.time() < deadline:
+            time.sleep(0.05)
+
+        # A real teleop worker on stand-in arms: E-STOP mid-move.
+        class _FakeArm:
+            def __init__(self, cfg=None):
+                self.bus = _NexBus()
+                self.config = types.SimpleNamespace(disable_torque_on_disconnect=True)
+                self.flag_at_disconnect = None
+
+            def connect(self, calibrate=True):
+                self.configure()
+
+            def configure(self):
+                pass
+
+            def get_observation(self):
+                return {k: 2000.0 for k in joints}
+
+            def get_action(self):
+                return {k: 2000.0 for k in joints}
+
+            def send_action(self, action):
+                return action
+
+            def disconnect(self):
+                self.flag_at_disconnect = self.config.disable_torque_on_disconnect
+
+        tele = Station()
+        tele.cfg = dict(st_cfg, **fake_ports)
+        arm_f, arm_l = _FakeArm(), _FakeArm()
+        tele._make_follower = lambda cameras=None: arm_f
+        tele._make_leader = lambda: arm_l
+        real_usable = tele.usable
+        tele.usable = lambda: (True, "ok")
+        released.clear()
+        tele.start_teleop()
+        time.sleep(2.6)                 # past the opening sync, into live teleop
+        moving = tele.mode == "teleop"
+        t0 = time.monotonic()
+        tele.emergency_stop()
+        while tele.mode != "idle" and time.monotonic() - t0 < 3:
+            time.sleep(0.01)
+        stopped_in = time.monotonic() - t0
+        check("E-STOP mid-move: teleop stops within a tick or two",
+              moving and tele.mode == "idle" and stopped_in < 0.5, f"{stopped_in * 1000:.0f} ms")
+        check("E-STOP mid-move: both arms go floppy, no 0.4 s re-hold on the way out",
+              arm_f.bus.torque is False and arm_l.bus.torque is False
+              and arm_f.flag_at_disconnect is False and arm_f.bus.log[-1] == ("torque", False),
+              str(arm_f.bus.log[-2:]))
+        tele.usable = real_usable
+        deadline = time.time() + 5
+        while tele._estop_busy and time.time() < deadline:
+            time.sleep(0.05)
+    finally:
+        robots.release = real_release
+    check("no emergency-stop backstop was left running to reach a real port",
+          not any(st_._estop_busy for st_ in (es, er, tele)))
+
+    # -- gripper guard: never keep pushing against a stop or a block
+    gg = Station()
+    gg.cfg = dict(st_cfg)
+    gg._limits = None
+    G = "gripper.pos"
+
+    def run(seq):
+        gg._grip = {}
+        return [gg._guard_gripper({G: t}, {G: a})[G] for t, a in seq]
+
+    T = hardware.GRIP_STALL_TICKS
+    outs = run([(2833.0, 2753.0)] * (T + 4))
+    check("NexArm gripper at its open stop: after a moment it is no longer pushed into it",
+          outs[:T - 1] == [2833.0] * (T - 1) and outs[T - 1:] == [2768.0] * 5, str(outs))
+    outs = run([(1689.0, 2100.0)] * (T + 2))
+    check("gripper on a block: held just past where it stopped, not crushed",
+          outs[-1] == 2085.0, str(outs))
+    moving = [(1700.0, 2700.0 - 60 * i) for i in range(10)]
+    check("a gripper that is moving is never held back", run(moving) == [1700.0] * 10)
+    slow = [(2680.0 - 2 * i, 2700.0 - 2 * i) for i in range(10)]
+    check("slow, careful closing is not mistaken for a stall", run(slow) == [t for t, _ in slow])
+    gg._grip = {}
+    seq = [(1689.0, 2100.0)] * (T + 2) + [(2833.0, 2100.0), (2833.0, 2200.0), (2833.0, 2400.0)]
+    outs = [gg._guard_gripper({G: t}, {G: a})[G] for t, a in seq]
+    check("letting go of the trigger releases the grip at once",
+          outs[-2:] == [2833.0, 2833.0], str(outs[-3:]))
+    out = gg._guard_gripper({G: 2833.0, "elbow_flex.pos": 1234.0},
+                            {G: 2753.0, "elbow_flex.pos": 999.0})
+    check("the guard never touches any other joint", out["elbow_flex.pos"] == 1234.0)
+    sg = Station()
+    sg._limits, sg._grip = so._limits, {}
+    outs = [sg._guard_gripper({G: 100.0}, {G: 80.0})[G] for _ in range(T + 2)]
+    check("SO-101 units: the same guard, in percent of the gripper's range",
+          outs[-1] == 81.0, str(outs))
 
 
 if __name__ == "__main__":

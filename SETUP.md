@@ -128,8 +128,8 @@ honest design.
 | **Save the recordings in this folder** | Choose where datasets are written. Empty means `datasets/` here. |
 | **Start recording** | Records one try of a job you name. No timer. |
 | **Done, save this try** | Saves it. Press Start again to add another try to the same job. |
-| **That went wrong, do it again** | Throws this try away and starts it over. |
-| **Throw it away and stop** | Ends the try without keeping it. |
+| **That went wrong, mark it deleted** | Ends the try, keeps it, and marks it deleted in `labels.csv`. |
+| **Labels for this try** | Names, where the block is, something wrong, type, notes: one line per try in `labels.csv`. |
 | **Play it back** | Replays a saved try on the arm, with nobody holding the leader. |
 | **Swap front and wrist** | The cameras were guessed the wrong way round. |
 | **Switch the motors off** | Frees a stuck arm. Hold it first — it drops. |
@@ -302,7 +302,7 @@ The station picks 8124 or 8125 instead. The URL it prints is the right one.
 python station/selftest.py
 ```
 
-142 checks: detection of every kind of arm, the page, the API, camera streams, the jump guard, the
+210 checks: detection of every kind of arm, the page, the API, camera streams, the jump guard, the
 railed-reading guard, the save folder, the replay guards, zero/one/two cameras,
 cross-platform behaviour, and that recordings are not set to upload. It never
 moves an arm.
@@ -342,6 +342,6 @@ the flag yourself.
 | `station/server.py` | Local web server, JSON API, MJPEG camera streams. |
 | `station/ui.html` | The page. No frameworks, no CDN. |
 | `station/release.py` | Switches the motors off. |
-| `station/selftest.py` | The 142 checks. |
+| `station/selftest.py` | The 210 checks. |
 | `nexarm.json` | Which port is which arm, which camera is which. Machine-specific, not committed. |
 | `datasets/` | Your recordings. Not committed. |

@@ -546,6 +546,155 @@ def release(kind: Kind, port: str, role: str = "follower") -> bool:
     return False
 
 
+def torque_off(device) -> bool:
+    """Every motor of one arm off, now, through the connection already open.
+
+    For the emergency stop, from its own thread or the worker's. A NexArm's bus
+    takes one command at a time from any thread. A LeRobot bus has no such lock:
+    a command that collides with the worker's own traffic fails, so the caller
+    repeats until this returns True. It never raises.
+    """
+    bus = getattr(device, "bus", None)
+    if bus is None:
+        return False
+    ok = True
+    try:
+        if hasattr(bus, "set_torque"):        # NexArm
+            bus.set_torque(False)
+        else:                                  # LeRobot motor bus
+            bus.disable_torque()
+    except Exception:
+        ok = False
+    # A NexArm's normal disconnect holds its pose for 0.4 s before letting go,
+    # which would stiffen an arm the emergency stop has just made floppy.
+    config = getattr(device, "config", None)
+    if config is not None and hasattr(config, "disable_torque_on_disconnect"):
+        config.disable_torque_on_disconnect = False
+    return ok
+
+
+NEXARM_JOINTS = ("shoulder_pan", "shoulder_lift", "elbow_flex",
+                 "wrist_flex", "wrist_roll", "gripper")
+
+
+def nexarm_follower_to_leader(pose: dict) -> dict:
+    """The leader pose that teleop would turn into this follower pose.
+
+    The inverse of Hiwonder's map_leader_to_follower: shoulder_lift is mirrored
+    (4096 - p), and the gripper is follower = 2833 + (leader - 2048) * 4, clamped
+    to [1195, 2833]. Every leader trigger position from 2048 up gives the clamped
+    open jaw, so an open jaw maps back to the trigger at 2048 -- at rest.
+    """
+    out = dict(pose)
+    if "shoulder_lift.pos" in pose:
+        out["shoulder_lift.pos"] = 4096.0 - float(pose["shoulder_lift.pos"])
+    if "gripper.pos" in pose:
+        out["gripper.pos"] = 2048.0 + (float(pose["gripper.pos"]) - 2833.0) / 4.0
+    return out
+
+
+class LeaderAsArm:
+    """A leader arm driven like a follower, to put it back at the start position.
+
+    Leaders normally run with their motors off, so a hand can move them. Here
+    they are switched on, walked slowly to the start, and left holding there;
+    the next Start lets them go again (every leader's configure() switches its
+    motors off).
+    """
+
+    def __init__(self, kind: Kind, leader):
+        self.kind, self.leader, self.bus = kind, leader, leader.bus
+        # torque_off() reads this; a leader's own disconnect never re-holds.
+        self.config = type("Cfg", (), {"disable_torque_on_disconnect": False})()
+
+    def to_leader_units(self, follower_pose: dict) -> dict:
+        if self.kind.raw_counts:
+            return nexarm_follower_to_leader(follower_pose)
+        return dict(follower_pose)      # LeRobot leader and follower share units
+
+    def get_observation(self) -> dict:
+        if self.kind.raw_counts:
+            raw = self.bus.read_positions()
+            return {f"{n}.pos": float(v) for n, v in zip(NEXARM_JOINTS, raw)}
+        values = self.bus.sync_read("Present_Position")
+        return {f"{m}.pos": float(v) for m, v in values.items()}
+
+    def send_action(self, action: dict) -> dict:
+        if self.kind.raw_counts:
+            self.bus.write_positions([int(round(float(action[f"{n}.pos"]))) for n in NEXARM_JOINTS])
+        else:
+            self.bus.sync_write("Goal_Position",
+                                {k.removesuffix(".pos"): float(v) for k, v in action.items()})
+        return action
+
+    def hold_where_it_is(self) -> None:
+        """Motors on, aiming at where the arm already is, so switching on never jumps."""
+        park_goal(self.bus)
+        if self.kind.raw_counts:
+            self.bus.set_torque(True)
+        else:
+            self.bus.enable_torque()
+
+    def let_go_of_port(self) -> None:
+        """Close the connection and keep holding: no torque change."""
+        if self.kind.raw_counts:
+            self.leader.disconnect()            # NexArm: just closes the port
+        else:
+            self.bus.disconnect(disable_torque=False)
+
+
+# SO-100/101 followers rest on low torque instead of going limp: enough to stay
+# upright on their own, little enough to push aside by hand. Feetech's RAM
+# Torque_Limit, out of 1000; a power cycle resets it to the motor's own
+# Max_Torque_Limit. A first guess -- raise it if the arm sags, lower it if stiff.
+SOFT_HOLD_TORQUE = 300
+
+
+def _is_feetech(bus) -> bool:
+    return "feetech" in type(bus).__module__.lower()
+
+
+def _max_torque(bus) -> dict:
+    """Each motor's own ceiling. LeRobot sets the SO gripper's to 500 so it cannot burn out."""
+    return {m: int(v) for m, v in bus.sync_read("Max_Torque_Limit", normalize=False).items()}
+
+
+def full_torque(bus) -> None:
+    """Undo a soft hold before driving: Torque_Limit is RAM and outlives a disconnect.
+
+    Back to each motor's own Max_Torque_Limit -- what it powers on with -- never
+    a flat 1000, which would undo the gripper's burnout protection.
+    """
+    if not _is_feetech(bus):
+        return
+    try:
+        bus.sync_write("Torque_Limit", _max_torque(bus), normalize=False)
+    except Exception:
+        pass
+
+
+def soft_hold(device) -> bool:
+    """Leave an SO follower holding where it is, gently, after it is let go of.
+
+    Only Feetech arms: a NexArm's board has motors on or off and nothing between,
+    so it keeps doing what it did. True if the soft hold was set.
+    """
+    bus = getattr(device, "bus", None)
+    if bus is None or not _is_feetech(bus):
+        return False
+    try:
+        park_goal(bus)
+        soft = {m: min(SOFT_HOLD_TORQUE, top) for m, top in _max_torque(bus).items()}
+        bus.sync_write("Torque_Limit", soft, normalize=False)
+        bus.enable_torque()
+    except Exception:
+        return False
+    config = getattr(device, "config", None)
+    if config is not None and hasattr(config, "disable_torque_on_disconnect"):
+        config.disable_torque_on_disconnect = False
+    return True
+
+
 def park_goal(bus) -> None:
     """Make the motors' goal the pose they are already in.
 

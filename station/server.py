@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import socket
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -109,19 +108,19 @@ def make_handler(station):
                              f"multipart/x-mixed-replace; boundary={BOUNDARY}")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            last = None
+            seq = -1
             try:
                 while True:
-                    jpeg = station.latest_jpeg(name)
-                    if jpeg is not None and jpeg is not last:
-                        last = jpeg
+                    # Each frame goes out the moment the camera makes it -- no
+                    # fixed rate, which used to cap the picture at 25 a second.
+                    jpeg, seq = station.wait_frame(name, seq, timeout=1.0)
+                    if jpeg is not None:
                         self.wfile.write(
                             f"--{BOUNDARY}\r\nContent-Type: image/jpeg\r\n"
                             f"Content-Length: {len(jpeg)}\r\n\r\n".encode()
                         )
                         self.wfile.write(jpeg)
                         self.wfile.write(b"\r\n")
-                    time.sleep(1 / 25)
             except (BrokenPipeError, ConnectionResetError, OSError):
                 # The tab was closed or the picture was swapped out. Not an error.
                 pass
@@ -132,7 +131,9 @@ def make_handler(station):
             path = self.path.split("?", 1)[0]
             body = self._read_json()
 
-            if path == "/api/detect/start":
+            if path == "/api/estop":
+                self._send_json(station.emergency_stop())
+            elif path == "/api/detect/start":
                 self._send_json(station.begin_arm_detect(kind=str(body.get("kind") or "")))
             elif path == "/api/prompt/next":
                 self._send_json(station.prompt_next())
@@ -140,6 +141,10 @@ def make_handler(station):
                 self._send_json(station.poll_arm_detect())
             elif path == "/api/cameras/swap":
                 self._send_json(station.swap_cameras())
+            elif path == "/api/cameras/set":
+                self._send_json(station.set_cameras(body.get("front"), body.get("wrist")))
+            elif path == "/api/cameras/rescan":
+                self._send_json(station.rescan_cameras())
             elif path == "/api/teleop/start":
                 self._send_json(station.start_teleop())
             elif path == "/api/record/start":
@@ -147,10 +152,14 @@ def make_handler(station):
             elif path == "/api/record/next":
                 station.events["exit_early"] = True
                 self._send_json({"ok": True})
+            elif path == "/api/labels":
+                self._send_json(station.set_labels(body))
             elif path == "/api/record/redo":
-                station.events["rerecord_episode"] = True
-                station.events["exit_early"] = True
-                self._send_json({"ok": True})
+                self._send_json(station.throw_away_try())
+            elif path == "/api/start/save":
+                self._send_json(station.save_start_position())
+            elif path == "/api/start/clear":
+                self._send_json(station.clear_start_position())
             elif path == "/api/stop":
                 self._send_json(station.stop())
             elif path == "/api/release":
@@ -172,4 +181,14 @@ def serve(station, port: int) -> ThreadingHTTPServer:
     httpd = ThreadingHTTPServer(("127.0.0.1", port), make_handler(station))
     httpd.daemon_threads = True
     threading.Thread(target=httpd.serve_forever, name="http", daemon=True).start()
+    # The camera pictures get a server of their own. A browser opens at most six
+    # connections to one address, and each picture holds one open for good --
+    # more than one after a camera hiccup restarts it. Sharing the page's
+    # address, they could use up all six, and every button press, EMERGENCY
+    # STOP included, waited in the browser's queue behind them.
+    sport = free_port(port + 10)
+    streams = ThreadingHTTPServer(("127.0.0.1", sport), make_handler(station))
+    streams.daemon_threads = True
+    threading.Thread(target=streams.serve_forever, name="http-streams", daemon=True).start()
+    station.stream_port = sport
     return httpd

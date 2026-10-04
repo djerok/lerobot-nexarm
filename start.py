@@ -63,7 +63,11 @@ ARM_SDKS = (
     ("scservo_sdk", "feetech-servo-sdk>=1.0.0,<2.0.0", "SO-100 / SO-101"),
     ("dynamixel_sdk", "dynamixel-sdk>=3.7.31,<3.9.0", "Koch, OpenManipulator-X"),
     ("deepdiff", "deepdiff>=7.0.1,<9.0.0", "both of the above"),
-)
+) + ((
+    # Windows: recognise each camera by identity, so an unplugged camera comes
+    # back in its own slot instead of whichever camera took over its number.
+    ("pygrabber", "pygrabber>=0.2,<1", "following cameras across unplugs"),
+) if sys.platform.startswith("win") else ())
 
 
 def missing_modules() -> list[tuple[str, str | None, str]]:
