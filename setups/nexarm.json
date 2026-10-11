@@ -1,0 +1,26 @@
+{
+  "robot_type": "nexarm",
+  "leader_port": "COM17",
+  "follower_port": "COM18",
+  "fps": 30,
+  "cameras": {
+    "front": 1,
+    "wrist": 2
+  },
+  "detected_at": "2026-10-11 16:23:45",
+  "cameras_chosen": true,
+  "camera_ids": {
+    "front": "\\\\?\\usb#vid_32e6&pid_9221&mi_00#7&7551382&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
+    "wrist": "\\\\?\\usb#vid_32e6&pid_9005&mi_00#7&1b96ccdd&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global"
+  },
+  "reset_pose": {
+    "shoulder_pan.pos": 2043.0,
+    "shoulder_lift.pos": 3386.0,
+    "elbow_flex.pos": 1035.0,
+    "wrist_flex.pos": 1852.0,
+    "wrist_roll.pos": 1138.0,
+    "gripper.pos": 2313.0
+  },
+  "reset_robot": "nexarm",
+  "baudrate": 1000000
+}

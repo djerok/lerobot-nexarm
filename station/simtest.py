@@ -54,6 +54,7 @@ fs.install()
 from station import detect, hardware  # noqa: E402
 
 detect.CONFIG_PATH = TMP / "nexarm.json"
+detect.SETUPS_DIR = TMP / "setups"
 detect.SHOTS_DIR = TMP / "shots"
 hardware.DATASETS_DIR = TMP / "datasets"
 detect.open_capture = lambda idx: fs.FakeCapture(idx)

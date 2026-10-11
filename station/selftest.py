@@ -12,6 +12,7 @@ The drag test is the one thing not covered here, because it needs a hand.
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import threading
 import time
@@ -34,6 +35,8 @@ PASS, FAIL = [], []
 # than no test.
 _REAL_CONFIG = detect.CONFIG_PATH
 detect.CONFIG_PATH = Path(__file__).resolve().parent / "selftest_nexarm.json"
+_REAL_SETUPS = detect.SETUPS_DIR
+detect.SETUPS_DIR = Path(__file__).resolve().parent / "selftest_setups"
 
 
 def check(name: str, cond, detail: str = "") -> None:
@@ -494,7 +497,10 @@ def main() -> int:
 
     print("\n14. the test left nothing behind")
     detect.CONFIG_PATH.unlink(missing_ok=True)
-    check("no scratch config left on disk", not detect.CONFIG_PATH.exists())
+    shutil.rmtree(detect.SETUPS_DIR, ignore_errors=True)
+    check("no scratch config left on disk",
+          not detect.CONFIG_PATH.exists() and not detect.SETUPS_DIR.exists())
+    check("the real setups/ was never touched", detect.SETUPS_DIR != _REAL_SETUPS)
     check("the real nexarm.json was never touched",
           detect.CONFIG_PATH != _REAL_CONFIG,
           f"real config is {_REAL_CONFIG.name}, test used {detect.CONFIG_PATH.name}")

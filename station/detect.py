@@ -26,6 +26,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT / "nexarm.json"
+# One saved setup per kind of arm, so plugging the SO-101 pair back in does not
+# mean redoing the NexArm's cameras and start pose, or the other way round.
+SETUPS_DIR = ROOT / "setups"
 SHOTS_DIR = ROOT / "station" / "shots"
 
 IS_WINDOWS = sys.platform.startswith("win")
@@ -61,12 +64,29 @@ def open_capture(index: int):
     format back to YUY2, and on some cameras (icspring 32e6:9221) MJPG only
     sticks when it is asked for again after the size. So: FPS first, then the
     format on both sides of the size.
+
+    Setting the format after opening is too late when the hub is already busy:
+    DirectShow starts the camera in raw YUY2 first, there is no bandwidth left
+    for that, and the open fails outright ("camera 1 (wrist) would not open").
+    Passing the format as open parameters asks for MJPG before streaming starts
+    (2026-10-11: the second icspring camera opened at MJPG beside a running
+    one). A camera that refuses those parameters gets the old path.
     """
     import cv2
 
+    mjpg = cv2.VideoWriter_fourcc(*"MJPG")
+    params = [cv2.CAP_PROP_FOURCC, mjpg,
+              cv2.CAP_PROP_FRAME_WIDTH, 640, cv2.CAP_PROP_FRAME_HEIGHT, 480,
+              cv2.CAP_PROP_FPS, 30]
+    try:
+        cap = cv2.VideoCapture(int(index), camera_backend(), params)
+        if cap.isOpened():
+            return cap
+        cap.release()
+    except Exception:
+        pass
     cap = cv2.VideoCapture(int(index), camera_backend())
     if cap.isOpened():
-        mjpg = cv2.VideoWriter_fourcc(*"MJPG")
         cap.set(cv2.CAP_PROP_FPS, 30)
         cap.set(cv2.CAP_PROP_FOURCC, mjpg)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -338,6 +358,52 @@ def save_config(cfg: dict) -> None:
     cfg = dict(cfg)
     cfg["detected_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    save_setup(cfg)
+
+
+def load_setup(kind: str) -> dict | None:
+    """The setup last saved for this kind of arm, if there is one."""
+    path = SETUPS_DIR / f"{kind}.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+    except Exception:
+        return None
+
+
+def save_setup(cfg: dict) -> None:
+    kind = cfg.get("robot_type")
+    if not kind:
+        return
+    SETUPS_DIR.mkdir(exist_ok=True)
+    (SETUPS_DIR / f"{kind}.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+def so101_plugged_in(setup: dict | None) -> bool:
+    """Both SO-101 boards of this setup are on USB, found by serial number.
+
+    The SO boards' CH343 has a serial number, so this cannot mistake a NexArm
+    (CH340, no serial) for them.
+    """
+    if not setup:
+        return False
+    wanted = {setup.get("leader_serial"), setup.get("follower_serial")}
+    if None in wanted or "" in wanted:
+        return False
+    present = {p.serial_number for p in usb_serial_ports() if p.serial_number}
+    return wanted <= present
+
+
+def choose_setup(cfg: dict | None) -> dict | None:
+    """SO-101 boards plugged in: the SO-101 setup. Anything else: the NexArm one.
+
+    Falls back to whatever was saved last when there is no setup for that kind.
+    """
+    so101 = load_setup("so101")
+    if so101_plugged_in(so101):
+        return so101
+    if cfg and (cfg.get("robot_type") or "nexarm") == "nexarm":
+        return cfg
+    return load_setup("nexarm") or cfg
 
 
 def config_is_usable(cfg: dict | None) -> tuple[bool, str]:

@@ -407,7 +407,12 @@ class Station:
     # ----------------------------------------------------------------- config
 
     def load(self) -> tuple[bool, str]:
-        self.cfg = detect.load_config() or {}
+        live = detect.load_config()
+        self.cfg = detect.choose_setup(live) or {}
+        if self.cfg and self.cfg.get("robot_type") != (live or {}).get("robot_type"):
+            detect.save_config(self.cfg)
+            kind = self.kind
+            self.say(f"Using the saved {kind.label if kind else self.cfg.get('robot_type')} setup.")
         ok, why = self.usable()
         self.setup_stage = "ready" if ok else "need_arms"
         if ok:
@@ -491,6 +496,10 @@ class Station:
                            "powered -- switch it off and on, then try again.",
                 }
 
+            # A new kind of arm starts from that kind's own saved setup (cameras,
+            # start position), if it has one.
+            if kind.key != (self.cfg.get("robot_type") or "nexarm"):
+                self.cfg = detect.load_setup(kind.key) or self.cfg
             # A new kind of arm means none of the old kind's names apply.
             # The start position stays: it belongs to the table, not to a USB port,
             # and it only applies to the kind of robot it was saved on anyway.

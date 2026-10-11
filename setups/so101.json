@@ -1,0 +1,20 @@
+{
+  "robot_type": "so101",
+  "leader_port": "COM10",
+  "follower_port": "COM9",
+  "fps": 30,
+  "leader_id": "so101_leader_5C82109071",
+  "follower_id": "so101_follower_5C82107173",
+  "leader_serial": "5C82109071",
+  "follower_serial": "5C82107173",
+  "cameras": {
+    "front": 1,
+    "wrist": 2
+  },
+  "cameras_chosen": true,
+  "camera_ids": {
+    "front": "\\\\?\\usb#vid_32e6&pid_9221&mi_00#7&7551382&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
+    "wrist": "\\\\?\\usb#vid_32e6&pid_9005&mi_00#7&1b96ccdd&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global"
+  },
+  "detected_at": "2026-10-11 00:00:00"
+}
