@@ -1,439 +1,190 @@
-# Hiwonder NexArm LeRobot VLA Open-Source 6-Axis Robotic Arm
+# Robot arm station: teleoperate and record from your browser
 
-English | [中文](./README_cn.md)
+One page in your browser drives a robot arm and records demonstrations. You hold one
+arm (the **leader**), the other one (the **follower**) copies it, and each try you
+record is saved as a LeRobot dataset you can train on.
 
-[NexArm](https://www.hiwonder.com/products/nexarm6-axis) is an open-source, [🤗 LeRobot](https://github.com/huggingface/lerobot)-native robotic arm designed for embodied AI research and rapid validation of imitation and reinforcement learning policies. Its dual‑chip architecture (ESP32 + AT32) enables synchronous leader‑follower teleoperation with millisecond‑level tracking latency, generating clean demonstration data that feeds directly into LeRobot training pipelines.
+It works with a leader/follower pair of **NexArm**, **SO-100 / SO-101**, **Koch** or
+**OpenManipulator-X**. It finds the arms and cameras by itself: you never type a port
+name or a camera number.
 
-The robotic arm features an all‑metal chassis driven by 65 kg·cm magnetic encoder servos, delivering ±2 mm repeatability and smooth, jitter‑free motion. Combined with advanced inverse kinematics and curve smoothing, it natively computes complex trajectories while minimizing start‑stop vibrations for fluid movement.
-
-For on‑device perception, NexArm integrates a 6 TOPS K230 vision module, allowing you to run multimodal large models and computer vision pipelines—such as YOLO tracking and hand‑eye coordinated grasping—without a PC. All schematics, firmware, and code are open source, making NexArm a transparent and modifiable platform for academic research and real‑world robotic prototyping.
-
-<p align="center">
-  <img src="./media/readme/VLA_architecture.jpg" alt="nexarm" width="600"/>
-</p>
-
-## 🎯 Compared to SO‑ARM101:
-
-- Payload: 500 g (150% improvement over SO‑ARM101)
-- Repeatability: ±2 mm (33% improvement over SO‑ARM101)
-- Architecture: ESP32 + AT32 dual‑chip design
-- Build: All‑metal body with rotating base and parallel‑rail gripper
-- Versatility: Supports multiple control methods out of the box
-
-## End-to-End Robotic Arm Comparison
-
-| Model | NexArm | SO-ARM101 |
-|-------|--------|-----------|
-| Payload | 500 g | 200 g |
-| Repeatability | ±2 mm | ±3 mm |
-| Workspace | 0.5 m | 0.4 m |
-| Joint Servo | Dual-output-shaft magnetic encoder bus servo | Single-output-shaft magnetic encoder bus servo with fixed shaft |
-| Body Material | Aerospace-grade metal structure | PLA 3D-printed structural parts |
-| End Effector | Parallel rail gripper | 3D-printed vertical-opening gripper |
-| Product Positioning | Advanced end-to-end development / advanced embodied AI applications | Entry-level end-to-end development / basic embodied AI applications |
+**Follow the steps below in order. Nothing else in this repository needs to be
+installed, configured or run.**
 
 ---
 
-## Table of Contents
+## Step 1. Check what you have
 
-- [Hardware Overview](#hardware-overview)
-- [Installation](#installation)
-- [Step 1: Find Serial Ports](#step-1-find-serial-ports)
-- [Step 2: Find Cameras](#step-2-find-cameras)
-- [Step 3: Teleoperation Test](#step-3-teleoperation-test)
-- [Step 4: Collect a Dataset](#step-4-collect-a-dataset)
-- [Step 5: Train a Policy](#step-5-train-a-policy)
-- [Step 6: Run Inference](#step-6-run-inference)
-- [Code Architecture](#code-architecture)
-- [Troubleshooting](#troubleshooting)
+- Both arms, each with its USB cable and its power supply.
+- **Windows 10 or 11**, or **macOS 12 or newer**. (Linux: use the macOS commands.)
+- Zero, one or two USB cameras. None is fine; the arms work without video.
+- About 6 GB of free disk space, and internet for the first install.
+- **You do not need to install Python.** The installer brings its own. On Windows, do
+  not install Python from the Microsoft Store for this.
 
----
+## Step 2. Get the code
 
-## Hardware Overview
-
-### Components
-
-| Component | Description |
-|-----------|-------------|
-| **Leader arm** | ESP32 board driving 6 × HX-30HM servos. Operator freely moves this arm during teleoperation. |
-| **Follower arm** | ESP32 + AT32F421 co-processor driving 6 × HX-30HM servos. Mirrors the leader or executes policy output. |
-| **Servos** | HX-30HM serial bus servos — 12-bit resolution (0–4095), 1 Mbps, high torque. |
-| **Cameras** | 2 × USB cameras: `front` (top-down workspace view) and `wrist` (end-effector close-up), 640×480 @ 30 FPS. |
-
-### Joint Layout (6 DOF)
-
-| Joint | Name | Notes |
-|-------|------|-------|
-| 1 | `shoulder_pan` | Base rotation |
-| 2 | `shoulder_lift` | Mirrored between leader and follower (4096 − pos) |
-| 3 | `elbow_flex` | Elbow |
-| 4 | `wrist_flex` | Wrist pitch |
-| 5 | `wrist_roll` | Wrist rotation |
-| 6 | `gripper` | Open/close, mapped range [1195, 2833] |
-
-### Communication Protocol
-
-NexArm uses a custom CommProtocol over USB serial:
+Open a terminal: on Windows, **PowerShell** (`Win`, type `powershell`, `Enter`); on a
+Mac, **Terminal** (`Cmd`+`Space`, type `terminal`, `Enter`). Then:
 
 ```
-Frame: [0xFF][0xFF][ID][LEN][CMD][ARGS...][CHECKSUM]
-```
-
-| CMD | Function | Direction |
-|-----|----------|-----------|
-| 56 | Set motion speed and acceleration (`motion_speed`, `motion_acc`) | Host → Follower |
-| 68 | Enter/exit LeRobot bridge mode (follower only) | Host → Follower |
-| 96 | Read 6 servo positions (12-byte reply) | Host → Device → Host |
-| 97 | Write 6 servo positions (12 bytes, no reply) | Host → Device |
-| 98 | Enable/disable torque | Host → Device |
-
----
-
-## Installation
-
-### Option A — conda (recommended)
-
-```bash
-git clone https://github.com/Hiwonder-official/lerobot-nexarm.git
+git clone https://github.com/djerok/lerobot-nexarm.git
 cd lerobot-nexarm
-
-conda create -n nexarm python=3.12 -y
-conda activate nexarm
-
-pip install -e ".[nexarm]"
 ```
 
-To enable real-time Rerun visualization during teleoperation:
+No `git`? On https://github.com/djerok/lerobot-nexarm click **Code → Download ZIP**,
+unzip it, and open the terminal in the unzipped folder.
 
-```bash
-pip install -e ".[nexarm,viz]"
+## Step 3. Install, once per computer
+
+**Windows** (PowerShell, inside the `lerobot-nexarm` folder):
+
+```
+powershell -ExecutionPolicy Bypass -File setup.ps1
 ```
 
-### Option B — venv
+**macOS** (Terminal, inside the `lerobot-nexarm` folder):
 
-```bash
-git clone https://github.com/Hiwonder-official/lerobot-nexarm.git
-cd lerobot-nexarm
-
-python -m venv .venv
-
-# Activate
-# Windows:
-.venv\Scripts\activate
-# Linux / macOS:
-source .venv/bin/activate
-
-pip install -e ".[nexarm]"
+```
+bash setup.sh
 ```
 
-### Verify
+The first time takes several minutes, mostly downloading PyTorch. It is not stuck. It
+then runs its own checks, which should report `0 failed`, and ends by printing the
+command for Step 5.
 
-```bash
-python -c "from lerobot.robots.nexarm_follower import NexArmFollower; print('OK')"
+## Step 4. Plug the robot in
+
+1. Both arms into USB.
+2. Both arms switched **on** with their own power switches. Plugged in is not enough.
+3. Cameras into USB, if you have them. A camera fixed to the gripper is the **wrist**
+   camera; the other is the **front** camera.
+
+## Step 5. Open the robot page
+
+**Windows:**
+
+```
+.\.venv\Scripts\python.exe start.py
 ```
 
-### Connect Hardware
+**macOS:**
 
-1. Plug the **follower arm** ESP32 into the PC via USB.
-2. Plug the **leader arm** ESP32 into the PC via USB.
-3. Plug in both USB cameras (front + wrist).
+```
+./.venv/bin/python start.py
+```
 
-### Platform Support
+Your browser opens the robot page. If it does not, the terminal prints the address
+(`Open this page:  http://127.0.0.1:8123/`); paste that into the browser. **Leave the
+terminal open** while you use the robot. Closing it stops the robot. Press `Ctrl`+`C`
+in it when you are finished.
 
-| Platform | Status | Notes |
-|----------|--------|-------|
-| Windows 10/11 | Verified | Install CH340 driver; port format `COM19` |
-| Ubuntu 20.04+ | Verified | Port format `/dev/ttyUSB0`; add user to `dialout` group |
-| macOS | Verified | Port format `/dev/tty.usbserial-xxx` |
+On a Mac, the first run asks for **Camera** permission: allow it. If it never asks and
+there is no picture, open **System Settings → Privacy & Security → Camera** and tick
+**Terminal**.
+
+**Every time after today, Step 5 is the only step.**
+
+## Step 6. The first time only: tell the page which arm is which
+
+The page asks you to **take the arm you will hold in your hand and wave it around for
+fifteen seconds.** Wave only that one, and move it a long way. That is how the computer
+tells the leader from the follower. It is saved, and not asked again unless a cable
+moves to a different USB socket.
+
+Arms other than a NexArm also need calibrating once per computer. The page walks you
+through it with a **Next** button: hold the arm, put every joint about halfway, press
+**Next**, move every joint to both ends, press **Next**.
+
+## Step 7. Teleoperate
+
+Press **Start moving**. Move the arm in your hand; the robot follows. If the two arms
+start in different poses, the robot glides over slowly first, then keeps up at full
+speed. **Stop** ends it.
+
+## Step 8. Record data
+
+1. In **Teach the robot a job**, type a name under **What is the job?** (for example
+   `pick red block`).
+2. Optional: **Save this spot as the start** while moving, so every try begins from
+   the same pose.
+3. Press **Start recording**. Wait until the page says **Recording. Do the job now.**,
+   then do the task with the arm in your hand.
+4. Press **Done, save this try**. There is no timer: take as long as you need.
+   If the try went badly, press **That went wrong, mark it deleted** instead.
+5. Fill in **Labels for this try** (driver, recorder, labeler, where the block was,
+   anything wrong).
+6. Press **Start recording** again for the next try. The same job name adds to the
+   same dataset, so a session of tries builds one dataset worth training on. The page
+   says **SWAP JOBS** every 10 tries.
+
+**Play it back** replays a saved try on the robot by itself. Keep clear of it.
+
+**Where recordings go:** `datasets/` in this folder (or a folder you choose on the
+page), one folder per job named after the robot and the job, e.g.
+`datasets/nexarm_pick_red_block/` (`so101_…` for an SO arm). Standard LeRobot format,
+with one line per try in
+`labels.csv`. Every
+try is kept and numbered: try N is episode N-1, and a deleted try is only marked
+`deleted` in `labels.csv`. **Nothing is uploaded anywhere.**
+
+## Safety
+
+- The big red **EMERGENCY STOP** is always on screen. It switches every motor off at
+  once. Both arms go floppy, so be ready to hold them.
+- **Switch the motors off** frees an arm that is stuck and will not move by hand. It
+  drops when the motors let go, so take its weight first.
+
+## If something is wrong
+
+| What you see | What to do |
+|---|---|
+| `found 1 arm(s), need 2` | A USB cable is out, or an arm is not switched on. |
+| `Could not tell them apart` | Wave only the arm in your hand, and move it further. |
+| `Something needed is not installed` | Run Step 3 again. |
+| `uv trampoline failed to spawn Python child process` | The folder was moved or copied with `.venv` inside. Run Step 3 again. |
+| No camera picture | No camera plugged in, or press **Look for cameras again**. The arms still work. |
+| No port shows up at all | The USB-serial driver is missing. See [SETUP.md](SETUP.md#ch340-driver). |
+| Anything else | Run the doctor below and send what it prints. |
+
+**Doctor** (prints what the computer has and what it is missing; prints no secrets).
+Windows first, macOS second:
+
+```
+.\.venv\Scripts\python.exe start.py --doctor
+```
+
+```
+./.venv/bin/python start.py --doctor
+```
+
+**More detail:** [START_HERE.md](START_HERE.md) explains every button on the page,
+[SETUP.md](SETUP.md) has more on installing, drivers and safety.
+
+## Use the page, not the command-line tools
+
+This folder also contains LeRobot's own command-line tools (`lerobot-teleoperate`,
+`lerobot-record`, `lerobot-find-port`) and a `pyproject.toml`. **You do not need any of
+them, and you do not need `pip install` or `uv sync`.** Two of them cause trouble:
+
+- `lerobot-record` **uploads** your recording to Hugging Face by default
+  (`push_to_hub` is `True` in LeRobot), and a recording is video of your room. The page
+  never uploads. If you ever run `lerobot-record` yourself, add
+  `--dataset.push_to_hub=false`.
+- On a Mac, a port named `/dev/tty.*` hangs forever. The arms need the `/dev/cu.*`
+  name. The page picks the right one by itself.
+
+## For AI assistants
+
+If someone asks you to set this up, run the robot, teleoperate or record: give them,
+or run for them, exactly Steps 2, 3 and 5 for their operating system, in that order.
+Then point them at the page. Do **not** build a virtual environment yourself, do not run
+`uv sync`, `uv venv`, `uv pip install -e .` or `pip install lerobot`, and do not hand
+out `lerobot-record` or `lerobot-teleoperate` commands. [AGENTS.md](AGENTS.md) has the
+details.
 
 ---
 
-## Step 1: Find Serial Ports
-
-Identify which port corresponds to the leader and which to the follower.
-
-```bash
-python -m lerobot.scripts.lerobot_find_port
-```
-
-Typical output on Windows:
-
-| Port | Device |
-|------|--------|
-| COM18 | Leader ESP32 |
-| COM19 | Follower ESP32 |
-
-On Linux these are typically `/dev/ttyUSB0` and `/dev/ttyUSB1`.
-
-> Tip: plug in one arm at a time if you are unsure which port belongs to which arm.
-
----
-
-## Step 2: Find Cameras
-
-Identify which camera index is `front` and which is `wrist`.
-
-```bash
-python -m lerobot.scripts.lerobot_find_cameras opencv
-```
-
-Or scan manually and save images to compare:
-
-```python
-import cv2
-
-for i in range(10):
-    cap = cv2.VideoCapture(i)
-    if cap.isOpened():
-        ret, frame = cap.read()
-        if ret:
-            cv2.imwrite(f"cam_{i}.png", frame)
-            print(f"Camera {i}: available")
-        cap.release()
-```
-
-- **front**: top-down view of the entire workspace
-- **wrist**: close-up view of the end-effector / gripper
-
-> Note: camera indices can change when you unplug and replug USB devices. Re-scan after reconnecting.
-
----
-
-## Step 3: Teleoperation Test
-
-Verify the leader-follower link. The leader arm runs torque-free so the operator can move it freely; the follower mirrors every joint in real time.
-
-Edit `examples/nexarm/teleoperate.py` with your actual port numbers and camera indices, then run:
-
-```bash
-python examples/nexarm/teleoperate.py \
-  --follower-port COM19 \
-  --leader-port COM18
-```
-
-Or pass everything on the command line directly:
-
-```bash
-python examples/nexarm/teleoperate.py \
-  --follower-port COM19 --leader-port COM18 \
-  --front-cam 0 --wrist-cam 1 --fps 30
-```
-
-### Motion Speed and Acceleration
-
-The follower arm's motion profile is controlled by two parameters in `NexArmFollowerConfig` (or via the YAML / command line):
-
-| Parameter | Default | Range | Description |
-|-----------|---------|-------|-------------|
-| `motion_speed` | `2000` | 0–3400 | Maximum servo speed in raw units/s. `0` = no limit. |
-| `motion_acc` | `100` | 0–254 | Acceleration ramp. `0` = instant (max acceleration). Higher = smoother ramp. |
-
-These are applied once at connection time via the firmware. You can override them in `examples/nexarm/teleoperate.py` by editing the `NexArmFollowerConfig`:
-
-```python
-follower_config = NexArmFollowerConfig(
-    port="COM19",
-    motion_speed=2000,   # adjust for faster or slower movement
-    motion_acc=100,      # adjust for harder or softer acceleration
-    cameras=camera_config,
-)
-```
-
-Or on the command line:
-
-```bash
-python examples/nexarm/teleoperate.py \
-  --follower-port COM19 --leader-port COM18
-```
-
-> Note: the firmware handles speed/acceleration limiting internally — no software-side delta clamping is applied.
-
-**What to check:**
-- Follower tracks the leader smoothly across all joints.
-- `shoulder_lift` direction is automatically mirrored.
-- Gripper open/close maps correctly.
-
----
-
-## Step 4: Collect a Dataset
-
-Record demonstration episodes via teleoperation for imitation learning.
-
-Edit `examples/nexarm/record.py`, then run:
-
-```bash
-python examples/nexarm/record.py \
-  --follower-port COM19 --leader-port COM18 \
-  --repo-id YOUR_HF_USERNAME/nexarm_pick \
-  --task "Pick up the red block" \
-  --num-episodes 50 --episode-time 10 --reset-time 10
-```
-
-**Key parameters:**
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `dataset.repo_id` | `local/nexarm_pick` | Dataset name (saved locally) |
-| `dataset.num_episodes` | 50 | Number of episodes to record |
-| `dataset.episode_time_s` | 10 | Duration of each episode (seconds) |
-| `dataset.reset_time_s` | 10 | Time between episodes to reset the scene |
-| `dataset.fps` | 30 | Recording frame rate |
-| `dataset.push_to_hub` | false | Upload to HuggingFace Hub |
-
-**Recording flow:**
-1. Script connects both arms and cameras automatically.
-2. Per episode: press Enter to start → move the leader arm → recording stops after `episode_time_s` → reset the scene within `reset_time_s`.
-3. Dataset is saved locally after all episodes complete.
-
-**Data quality tips:**
-- Record at least **50 episodes** for usable training results.
-- Keep start positions consistent across episodes.
-- Ensure clear camera views and stable lighting.
-- Each episode should contain one complete task execution (reach → grasp → lift → place).
-
----
-
-## Step 5: Train a Policy
-
-Train an ACT (Action Chunking with Transformers) policy on the collected dataset.
-
-Install training dependencies:
-
-```bash
-pip install -e ".[nexarm,training]"
-```
-
-Run training:
-
-```bash
-python -m lerobot.scripts.lerobot_train \
-  --dataset.repo_id=local/nexarm_pick \
-  --policy.type=act \
-  --output_dir=outputs/train/nexarm_act \
-  --batch_size=32 \
-  --steps=100000 \
-  --save_freq=25000
-```
-
-**Training recommendations:**
-
-| Item | Recommended | Notes |
-|------|-------------|-------|
-| Hardware | CUDA GPU | RTX 3090 or better preferred |
-| Episodes | 50+ | More is better |
-| Steps | 100,000 | Adjust based on loss curve |
-| Batch size | 32 | Reduce to 16 if VRAM is limited |
-| Save frequency | 25,000 | Checkpoint every 25 k steps |
-
-Checkpoints are saved to:
-
-```
-outputs/train/nexarm_act/checkpoints/last/pretrained_model/
-├── config.json
-├── model.safetensors
-├── policy_preprocessor.json
-├── policy_postprocessor.json
-└── train_config.json
-```
-
----
-
-## Step 6: Run Inference
-
-Deploy the trained policy on the real robot. The follower arm executes actions predicted by the model — no leader arm needed.
-
-```bash
-python examples/nexarm/rollout.py \
-  --follower-port COM19 \
-  --policy-path outputs/train/nexarm_act/checkpoints/last/pretrained_model
-```
-
-**Notes:**
-- No `--teleop` argument needed — the policy replaces the human operator.
-- Each run appends a timestamp to `repo_id` automatically to avoid conflicts.
-- The run is recorded as a dataset for later analysis.
-- With a GPU the policy runs at 30 Hz; on CPU, ACT action chunking (chunk_size=100) keeps throughput at 20–30 Hz because model inference only fires when the action queue empties.
-
-**Rollout strategies:**
-
-| Strategy | Flag | Description |
-|----------|------|-------------|
-| `base` | `--strategy.type=base` | Inference only, no recording |
-| `sentry` | `--strategy.type=sentry` | Continuous recording + auto-save (recommended for evaluation) |
-| `highlight` | `--strategy.type=highlight` | Ring buffer, press key to save highlights |
-| `dagger` | `--strategy.type=dagger` | Human-robot collaboration, requires leader arm |
-
----
-
-## Code Architecture
-
-```
-src/lerobot/
-├── motors/nexarm/
-│   ├── __init__.py                  # Exports NexArmMotorsBus
-│   └── nexarm.py                    # CommProtocol framing, position read/write, torque, bridge mode
-├── robots/nexarm_follower/
-│   ├── __init__.py
-│   ├── config_nexarm_follower.py    # RobotConfig subclass (port, cameras, baudrate)
-│   └── nexarm_follower.py           # Robot subclass (connect, observe, send_action)
-└── teleoperators/nexarm_leader/
-    ├── __init__.py
-    ├── config_nexarm_leader.py      # TeleoperatorConfig subclass
-    └── nexarm_leader.py             # Teleoperator subclass (read positions, leader→follower mapping)
-```
-
-**Modified upstream files:**
-
-| File | Change |
-|------|--------|
-| `src/lerobot/robots/utils.py` | Added `nexarm_follower` branch in `make_robot_from_config()` |
-| `src/lerobot/teleoperators/utils.py` | Added `nexarm_leader` branch in `make_teleoperator_from_config()` |
-| `pyproject.toml` | Added `nexarm` optional dependency group |
-| `src/lerobot/cameras/opencv/camera_opencv.py` | Fixed `stop_event` race condition on Linux |
-| `src/lerobot/processor/normalize_processor.py` | Added device/dtype caching to avoid redundant `.to()` calls |
-
----
-
-## Troubleshooting
-
-**Serial port permission denied (Linux)**
-```bash
-sudo usermod -a -G dialout $USER
-# Log out and back in
-```
-
-**Camera not found**
-- Run `lerobot-find-cameras opencv` to scan available indices.
-- Close other programs using the camera (OBS, browser, etc.).
-- Re-scan after unplugging and replugging USB devices.
-
-**Follower arm does not move during teleoperation**
-1. Confirm the follower COM port is correct.
-2. Confirm the follower ESP32 firmware supports CMD 68 (LeRobot bridge mode).
-3. Try power-cycling the follower arm.
-
-**TimeoutError during data collection**
-```
-TimeoutError: No position reply from NexArm
-```
-The leader firmware prints debug lines over Serial that corrupt protocol frames. The driver retries 3 times automatically. To eliminate the issue permanently, comment out the `Serial.printf` calls in `Nex_Arm.ino` inside the `lerobotMode == true` branch and reflash the firmware.
-
-**Training loss does not decrease**
-- Ensure you have at least 50 episodes.
-- Verify camera frames are not black or blurry.
-- Try increasing the learning rate: `--policy.optimizer_lr=1e-4`.
-
-**Robot moves hesitantly / small motion amplitude**
-The model collapsed to the mean. Try:
-- Lower `kl_weight`: `--policy.kl_weight=5.0` or `1.0`
-- Increase `batch_size`: `--batch_size=64`
-- Record more consistent episodes (same start position, complete task each time)
-- Train longer: `--steps=200000`
-
-**Low inference FPS on CPU**
-ACT uses action chunking (chunk_size=100) so CPU inference is normally 20–30 Hz. If slower:
-- Check no background processes are saturating the CPU.
-- Dual-camera capture adds ~45 ms per frame — this is expected.
-
-**Checksum errors**
-The leader firmware has a known checksum bug. The driver accepts both correct and incorrect checksums for compatibility.
+Built on [Hiwonder's lerobot-nexarm](https://github.com/Hiwonder-official/lerobot-nexarm),
+a fork of [Hugging Face LeRobot](https://github.com/huggingface/lerobot). Apache-2.0,
+see [LICENSE](LICENSE).

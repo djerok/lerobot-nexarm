@@ -128,7 +128,7 @@ do the fifteen-second wave again. Nothing is broken.
 | `Could not tell them apart` | Two arms moved, or neither did. Wave one, further. |
 | `COM7 is gone -- a cable moved` | Correct, and it is about to ask you to redo the wave. |
 | No picture | No camera plugged in. The arms still work without one. |
-| `Something needed is not installed` | Run `setup.ps1` first. |
+| `Something needed is not installed` | Run the setup script first: `setup.ps1` on Windows, `bash setup.sh` on macOS. |
 
 ## Checking the software without the robot
 

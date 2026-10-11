@@ -1,75 +1,109 @@
-This file provides guidance to AI agents when working with code in this repository.
+# Instructions for AI agents in this repository
 
-> **User-facing help → [`AGENT_GUIDE.md`](./AGENT_GUIDE.md)** (SO-101 setup, recording, picking a policy, training duration, eval — with copy-pasteable commands).
+This repository is used through **one thing: the browser station that `start.py`
+opens.** It teleoperates a leader/follower arm pair (NexArm, SO-100/SO-101, Koch,
+OpenManipulator-X) and records LeRobot datasets. When a person asks you to set it up,
+run the robot, teleoperate, or record data, your job is to get them to that page.
 
-## Project Overview
+## Setting it up for someone
 
-This is the **Hiwonder NexArm** fork of LeRobot — a PyTorch-based library for real-world robotics. It adds NexArm hardware support (motor driver, robot, teleoperator) on top of the upstream LeRobot codebase. It integrates with Hugging Face Hub for model/dataset sharing.
+Give them these commands in this order, or run them for them. Nothing else.
 
-**NexArm-specific modules** (added on top of upstream):
+**Windows** (PowerShell):
 
-| Path | What it does |
-|---|---|
-| `src/lerobot/motors/nexarm/` | CommProtocol UART framing, 6-servo sync read/write, torque, bridge mode (CMD 56/68/96/97/98) |
-| `src/lerobot/robots/nexarm_follower/` | `NexArmFollowerConfig` + `NexArmFollower` — connect, observe, send_action |
-| `src/lerobot/teleoperators/nexarm_leader/` | `NexArmLeaderConfig` + `NexArmLeader` — read positions, leader→follower joint mapping |
-| `examples/nexarm/` | Ready-to-run scripts for teleoperate, record, and rollout |
-
-**Modified upstream files:**
-
-| File | Change |
-|---|---|
-| `src/lerobot/robots/utils.py` | Added `nexarm_follower` branch in `make_robot_from_config()` |
-| `src/lerobot/teleoperators/utils.py` | Added `nexarm_leader` branch in `make_teleoperator_from_config()` |
-| `pyproject.toml` | Added `nexarm` optional dependency group |
-| `src/lerobot/cameras/opencv/camera_opencv.py` | Fixed `stop_event` race condition on Linux |
-| `src/lerobot/processor/normalize_processor.py` | Added device/dtype caching to avoid redundant `.to()` calls |
-
-## Tech Stack
-
-Python 3.12+ · PyTorch · Hugging Face (datasets, Hub, accelerate) · draccus (config/CLI) · Gymnasium (envs) · uv (package management)
-
-## Development Setup
-
-```bash
-uv sync --locked                            # Base dependencies
-uv sync --locked --extra test --extra dev   # Test + dev tools
-uv sync --locked --extra all                # Everything
-git lfs install && git lfs pull             # Test artifacts
+```
+git clone https://github.com/djerok/lerobot-nexarm.git
+cd lerobot-nexarm
+powershell -ExecutionPolicy Bypass -File setup.ps1
+.\.venv\Scripts\python.exe start.py
 ```
 
-## Key Commands
+**macOS / Linux** (Terminal):
 
-```bash
-uv run pytest tests -svv --maxfail=10                 # All tests
-DEVICE=cuda make test-end-to-end                      # All E2E tests
-pre-commit run --all-files                           # Lint + format (ruff, typos, bandit, etc.)
+```
+git clone https://github.com/djerok/lerobot-nexarm.git
+cd lerobot-nexarm
+bash setup.sh
+./.venv/bin/python start.py
 ```
 
-## Architecture (`src/lerobot/`)
+Skip the clone if they already have the folder; check that `start.py` is in it. If
+`start.py` is missing, the folder is a different fork: clone the URL above.
 
-- **`scripts/`** — CLI entry points (`lerobot-train`, `lerobot-eval`, `lerobot-record`, etc.), mapped in `pyproject.toml [project.scripts]`.
-- **`configs/`** — Dataclass configs parsed by draccus. `train.py` has `TrainPipelineConfig` (top-level). `policies.py` has `PreTrainedConfig` base. Polymorphism via `draccus.ChoiceRegistry` with `@register_subclass("name")` decorators.
-- **`policies/`** — Each policy in its own subdir. All inherit `PreTrainedPolicy` (`nn.Module` + `HubMixin`) from `pretrained.py`. Factory with lazy imports in `factory.py`.
-- **`processor/`** — Data transformation pipeline. `ProcessorStep` base with registry. `DataProcessorPipeline` / `PolicyProcessorPipeline` chain steps.
-- **`datasets/`** — `LeRobotDataset` (episode-aware sampling + video decoding) and `LeRobotDatasetMetadata`.
-- **`envs/`** — `EnvConfig` base in `configs.py`, factory in `factory.py`. Each env subclass defines `gym_kwargs` and `create_envs()`.
-- **`robots/`, `motors/`, `cameras/`, `teleoperators/`** — Hardware abstraction layers.
-- **`types.py`** and **`configs/types.py`** — Core type aliases and feature type definitions.
+`setup.ps1` / `setup.sh` run once per computer. They install `uv`, build `.venv` with
+Python 3.12, install LeRobot plus the recording and motor packages, and run the checks.
+After that, the last line alone starts everything. The page finds the arms, ports and
+cameras itself, and walks the person through telling leader from follower (a 15-second
+wave) and, for non-NexArm arms, calibration. [README.md](README.md) is the human
+version of the same steps, and [START_HERE.md](START_HERE.md) explains every button.
 
-## Repository Structure (outside `src/`)
+## Do not
 
-- **`tests/`** — Pytest suite organized by module. Fixtures in `tests/fixtures/`, mocks in `tests/mocks/`. Hardware tests use skip decorators from `tests/utils.py`. E2E tests via `Makefile` write to `tests/outputs/`.
-- **`.github/workflows/`** — CI: `quality.yml` (pre-commit), `fast_tests.yml` (base deps, every PR), `full_tests.yml` (all extras + E2E + GPU, post-approval), `latest_deps_tests.yml` (daily lockfile upgrade), `security.yml` (TruffleHog), `release.yml` (PyPI publish on tags).
-- **`docs/source/`** — HF documentation (`.mdx` files). Per-policy READMEs, hardware guides, tutorials. Built separately via `docs-requirements.txt` and CI workflows.
-- **`examples/`** — End-user tutorials and scripts organized by use case (dataset creation, training, hardware setup).
-- **`docker/`** — Dockerfiles for user (`Dockerfile.user`) and CI (`Dockerfile.internal`).
-- **`benchmarks/`** — Performance benchmarking scripts.
-- **Root files**: `pyproject.toml` (single source of truth for deps, build, tool config), `Makefile` (E2E test targets), `uv.lock`, `CONTRIBUTING.md` & `README.md` (general information).
+- **Do not build or repair the environment by hand.** No `uv sync`, `uv venv`,
+  `uv pip install -e .`, `pip install -e ".[nexarm]"` or `pip install lerobot`. The
+  setup script does all of it, with pinned versions: plain `pip install -e .` misses
+  the recording dependencies, and the newest `av` breaks LeRobot's imports. If `.venv`
+  is broken (`uv trampoline failed to spawn Python child process`), run the setup
+  script again; `start.py` also rebuilds a `.venv` that will not start.
+- **Do not give people `lerobot-record`, `lerobot-teleoperate` or `lerobot-find-port`
+  commands.** The page replaces all three. `lerobot-record` uploads the recording to a
+  Hugging Face dataset by default (`push_to_hub: bool = True` in
+  `src/lerobot/configs/dataset.py`), and a recording is video of the person's room.
+  The station always passes `push_to_hub=false`. On macOS, `/dev/tty.*` serial ports
+  block forever waiting for a carrier signal the arms never send; only `/dev/cu.*`
+  works, and the station picks it by itself.
+- **Do not ask for, or type, COM port names or camera indices.** Detection is automatic.
+- **Do not copy `.venv` between computers or folders.** It holds an absolute path to
+  one Python build. Clone and run the setup script instead.
 
-## Notes
+## When something fails
 
-- **Mypy is gradual**: strict only for `lerobot.envs`, `lerobot.configs`, `lerobot.optim`, `lerobot.model`, `lerobot.cameras`, `lerobot.motors`, `lerobot.transport`. Add type annotations when modifying these modules.
-- **Optional dependencies**: many policies, envs, and robots are behind extras (e.g., `lerobot[aloha]`). New imports for optional packages must be guarded or lazy. See `pyproject.toml [project.optional-dependencies]`.
-- **Video decoding**: datasets can store observations as video files. `LeRobotDataset` handles frame extraction, but tests need ffmpeg installed.
-- **Prioritize use of `uv run`** to execute Python commands (not raw `python` or `pip`).
+Run the doctor and read what it says. It prints the platform, the interpreter, uv,
+venv health, every required import, serial ports and cameras:
+
+```
+.\.venv\Scripts\python.exe start.py --doctor
+```
+
+```
+./.venv/bin/python start.py --doctor
+```
+
+The common messages and their fixes are in README.md ("If something is wrong") and
+SETUP.md ("Troubleshooting"), including the CH340 driver.
+
+## Changing the station's code
+
+| Path | What it is |
+|---|---|
+| `start.py` | The one command: checks the environment, starts the server, opens the browser |
+| `station/detect.py` | Finds USB serial ports and cameras |
+| `station/robots.py` | One `Kind` per arm type: detection, the wave test, safety numbers |
+| `station/hardware.py` | Owns the arms and cameras; teleop, record, replay, E-STOP |
+| `station/server.py` | Local web server and the camera streams |
+| `station/ui.html` | The page |
+| `station/release.py` | Switches the motors off |
+| `station/selftest.py` | Checks that never move an arm |
+
+After any change, run the checks with the station's own Python and keep them at
+`0 failed`:
+
+```
+.\.venv\Scripts\python.exe station\selftest.py
+```
+
+```
+./.venv/bin/python station/selftest.py
+```
+
+Safety rules in `station/hardware.py` are deliberate: railed readings (0 or 4095) are
+dropped, targets are capped per tick, the opening sync is gentle, the follower's current
+position is written as its goal before torque is enabled, and E-STOP switches torque off
+directly instead of waiting for the loop it stops. Do not loosen them.
+
+`src/lerobot/` is LeRobot, with NexArm support added by Hiwonder
+(`src/lerobot/motors/nexarm/`, `src/lerobot/robots/nexarm_follower/`,
+`src/lerobot/teleoperators/nexarm_leader/`). The station imports it. The older
+command-line tools `nexarm.py`, `nexarm_autoconfig.py`, `teleop_nocam.py` and
+`probe_arms.py` still work (they use `examples/nexarm/`), but people should be sent to
+the page.

@@ -61,7 +61,7 @@ installs LeRobot and the recording dependencies, and then runs the checks.
 **It takes several minutes the first time** because PyTorch is large. It is not
 stuck.
 
-Expect the checks to end with something like `82 passed, 0 failed`. A few camera
+Expect the checks to end with `0 failed` (the number passed grows as checks are added). A few camera
 checks are skipped if the robot page is already open — that is normal and it
 says so.
 
