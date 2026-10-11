@@ -1132,6 +1132,79 @@ def any_kind_of_arm(st_cfg: dict) -> None:
         check("an SO-101 recording is replayed on an SO-101",
               so._recorded_on_other_kind(root) is None)
 
+    # -- an SO bus that loses a reply asks again, instead of ending the try
+    from lerobot.motors import Motor, MotorNormMode
+    from lerobot.motors.feetech import FeetechMotorsBus
+
+    check("every Feetech read, write and ping asks again before giving up",
+          getattr(FeetechMotorsBus, "_station_retries", False) is True)
+
+    class _LossyHandler:
+        """Two replies lost, then an answer."""
+        def __init__(self):
+            self.calls = 0
+
+        def read2ByteTxRx(self, port, motor_id, address):
+            self.calls += 1
+            return (2048, 0, 0) if self.calls > 2 else (0, -6, 0)    # -6: no status packet
+
+        def getTxRxResult(self, comm):
+            return "[TxRxResult] There is no status packet!"
+
+    lossy = FeetechMotorsBus("COM98", {"m": Motor(1, "sts3215", MotorNormMode.RANGE_M100_100)})
+    lossy.packet_handler = _LossyHandler()
+    try:
+        got = lossy._read(56, 2, 1)[0]
+    except Exception as exc:
+        got = f"{type(exc).__name__}: {exc}"
+    check("...so two lost replies in a row still get the reading",
+          got == 2048 and lossy.packet_handler.calls == 3, str(got))
+
+    # -- a job whose first try never got saved can still be recorded
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = Station()
+        ds.cfg = dict(so.cfg, datasets_dir=tmp)
+        empty = ds._job_root("lost job")
+        (empty / "meta").mkdir(parents=True)
+        (empty / "meta" / "info.json").write_text(json.dumps({"total_episodes": 0}), encoding="utf-8")
+        check("a job folder with no saved try in it is started afresh, not added to",
+              ds.record_config("lost job").resume is False)
+        ds._set_aside_unsaved(empty)
+        moved = list((Path(tmp) / ".unsaved").glob("so101_lost_job-*"))
+        check("...and is moved aside to datasets/.unsaved, never deleted",
+              not empty.exists() and len(moved) == 1 and (moved[0] / "meta" / "info.json").is_file(),
+              str(moved))
+        kept = ds._job_root("kept job")
+        (kept / "meta").mkdir(parents=True)
+        (kept / "meta" / "info.json").write_text(json.dumps({"total_episodes": 2}), encoding="utf-8")
+        ds._set_aside_unsaved(kept)
+        check("a job with saved tries is added to, and never moved",
+              kept.exists() and ds.record_config("kept job").resume is True)
+        check("the replay list leaves the unsaved folder out",
+              [d["name"] for d in ds.list_datasets()] == ["so101_kept_job"],
+              str([d["name"] for d in ds.list_datasets()]))
+
+    # -- EMERGENCY STOP: a connection the worker closed mid-cut goes through its port at once
+    es = Station()
+    es.cfg = dict(so.cfg)
+    es._live = {"follower": types.SimpleNamespace(bus=None)}
+    calls = []
+    real_off = (robots.torque_off, robots.is_open, robots.release)
+    robots.torque_off = lambda dev: False
+    robots.is_open = lambda dev: False
+    robots.release = lambda kind, port, role="follower": calls.append(
+        (port, role, time.monotonic())) or True
+    t0 = time.monotonic()
+    try:
+        es._estop_release()
+    finally:
+        robots.torque_off, robots.is_open, robots.release = real_off
+    first = calls[0] if calls else None
+    check("EMERGENCY STOP: an arm whose connection closed mid-cut is switched off through its "
+          "port at once", first is not None and first[0] == es.cfg["follower_port"]
+          and first[2] - t0 < 0.2,
+          f"{[(p, r) for p, r, _ in calls]}, first after {(first[2] - t0) if first else 0:.2f} s")
+
     # -- cameras: any camera in either slot, and each picture at its own camera's speed
     import numpy as np
 

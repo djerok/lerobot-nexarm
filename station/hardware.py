@@ -327,6 +327,8 @@ class Station:
         self._cancel = threading.Event()
         self._calibrating = ""
 
+        robots.retry_lost_replies()
+
     @property
     def kind(self) -> robots.Kind | None:
         """The kind of arm the saved setup is for.
@@ -1486,20 +1488,20 @@ class Station:
         from lerobot.scripts import lerobot_record as lr
 
         fps = int(self.cfg.get("fps", 30))
-        slug = "".join(c if c.isalnum() else "_" for c in task.lower()).strip("_")[:40] or "task"
         # These only give the dataset its picture size: record() is handed the
         # station's running cameras (_StationCamera) and never opens these.
         cams = {
             name: OpenCVCameraConfig(index_or_path=int(idx), width=640, height=480, fps=fps)
             for name, idx in self.cfg.get("cameras", {}).items()
         }
-        root = self.datasets_dir() / f"{self.kind.key}_{slug}"
+        root = self._job_root(task)
 
         # Already recorded this job before? Add to it instead of colliding
         # with it. LeRobotDataset.create refuses to write over an existing
         # dataset, and a child pressing the same button twice should get a
-        # second try, not an error.
-        resume = (root / "meta" / "info.json").is_file()
+        # second try, not an error. Only a dataset with a saved try in it can
+        # be added to -- see _set_aside_unsaved.
+        resume = self._episodes_in(root) > 0
 
         return lr.RecordConfig(
             robot=self._record_robot_config(cams),
@@ -1551,6 +1553,30 @@ class Station:
             play_sounds=False,
         )
 
+    def _job_root(self, task: str) -> Path:
+        """A job's dataset folder: the kind of arm, then the job's name."""
+        slug = "".join(c if c.isalnum() else "_" for c in task.lower()).strip("_")[:40] or "task"
+        return self.datasets_dir() / f"{self.kind.key}_{slug}"
+
+    def _set_aside_unsaved(self, root: Path) -> None:
+        """Move a job's folder that holds no saved try out of the way. Never deletes it.
+
+        A first try that never got saved -- Done, Stop or EMERGENCY STOP pressed
+        while the robot was still getting ready, or an error halfway -- leaves a
+        dataset folder with no try in it. lerobot cannot add to one of those: it
+        goes looking for the rest of it on the Hugging Face hub, so every later
+        try of that job failed until someone deleted the folder by hand.
+        """
+        if not root.exists() or self._episodes_in(root) > 0:
+            return
+        dest = root.parent / ".unsaved" / f"{root.name}-{time.strftime('%Y%m%d-%H%M%S')}"
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            root.rename(dest)
+            self.say(f"An earlier try of this job was never saved. Its folder is now {dest}.")
+        except Exception as exc:
+            self.say(f"Could not move the unsaved folder {root} out of the way: {exc}")
+
     def _record_worker(self, task: str) -> None:
         from lerobot.scripts import lerobot_record as lr
 
@@ -1571,9 +1597,23 @@ class Station:
         real_get_obs = follower_cls.get_observation
         real_send = follower_cls.send_action
         real_connect = follower_cls.connect
+        real_disconnect = follower_cls.disconnect
         station = self
         self._last_sent = {}
         began = time.monotonic()
+        rested = {"ok": False}
+
+        def resting_disconnect(self_robot, *args, **kwargs):
+            """record()'s own disconnect leaves an SO follower resting where the try ended.
+
+            It switched the motors off instead, unless a start position was
+            saved, and the arm folded toward the table before the station could
+            connect again to catch it -- 13 degrees in the first 0.16 s on a
+            simulated SO-101. A NexArm has no soft hold and is let go as before.
+            """
+            if not station._estop.is_set() and robots.soft_hold(self_robot):
+                rested["ok"] = True
+            return real_disconnect(self_robot, *args, **kwargs)
 
         def station_connect(self_robot, *args, **kwargs):
             """record()'s robot gets the station's running cameras, and is noted as live."""
@@ -1644,8 +1684,10 @@ class Station:
                 follower_cls.get_observation = teeing_get_obs
                 follower_cls.send_action = limited_send
                 follower_cls.connect = station_connect
+                follower_cls.disconnect = resting_disconnect
 
                 self.datasets_dir().mkdir(parents=True, exist_ok=True)
+                self._set_aside_unsaved(self._job_root(task))
                 cfg = self.record_config(task)
                 root = Path(cfg.dataset.root)
                 try_no = self._episodes_in(root)
@@ -1673,22 +1715,30 @@ class Station:
         except robots.Cancelled:
             self.say("Stopped before the arms were ready. Nothing was recorded.")
         except Exception as exc:
-            self.error = f"{type(exc).__name__}: {exc}"
-            self.say(f"Recording stopped with an error: {self.error}")
-            traceback.print_exc()
+            if (isinstance(exc, ValueError) and "frames" in str(exc)
+                    and self.status.get("phase") != "recording"):
+                # Done, That went wrong or Stop while the robot was still getting
+                # ready: lerobot refuses to save a try with nothing in it.
+                self.say("The try ended before recording began, so there was nothing to save.")
+            else:
+                self.error = f"{type(exc).__name__}: {exc}"
+                self.say(f"Recording stopped with an error: {self.error}")
+                traceback.print_exc()
         finally:
             self._live.clear()
             lr.init_keyboard_listener = real_listener
             follower_cls.get_observation = real_get_obs
             follower_cls.send_action = real_send
             follower_cls.connect = real_connect
+            follower_cls.disconnect = real_disconnect
             # After record()'s own patches are off: going back must use the plain
             # send, not the recording's -- whose gripper guard reads the last
             # observation record() took, which stops updating when it returns.
             # The park-before-torque patch stays on for this connect.
-            if go_home:
-                self._return_to_start(int(self.cfg.get("fps", 30)))
-            if not self._estop.is_set():
+            if go_home and self._start_pose() is not None:
+                # Connected again to go back, so resting is up to that now.
+                rested["ok"] = self._return_to_start(int(self.cfg.get("fps", 30)))
+            if not self._estop.is_set() and not rested["ok"]:
                 self._soft_hold_follower()
             follower_cls.configure = real_configure
             with self.lock:
@@ -1850,10 +1900,19 @@ class Station:
         self._limits = self._limits_for(probe)
         real_send = follower_cls.send_action
         real_get_obs = follower_cls.get_observation
+        real_disconnect = follower_cls.disconnect
         station = self
         self._last_sent = {}
         self._grip, self._last_obs = {}, None
         root = self.datasets_dir() / name
+
+        def resting_disconnect(self_robot, *args, **kwargs):
+            # Replay ends -- or Stop ends it -- with an SO follower resting where it
+            # got to, like every other mode. It used to switch the motors off and
+            # fold onto whatever the replay had just set down.
+            if not station._estop.is_set():
+                robots.soft_hold(self_robot)
+            return real_disconnect(self_robot, *args, **kwargs)
 
         def keeping_get_obs(self_robot):
             obs = real_get_obs(self_robot)
@@ -1888,6 +1947,7 @@ class Station:
             self._stop.clear()
             follower_cls.send_action = limited_send
             follower_cls.get_observation = keeping_get_obs
+            follower_cls.disconnect = resting_disconnect
             self.say(f"Replaying {name}, try {episode + 1}. Keep hands clear.")
             cfg = lrp.ReplayConfig(
                 robot=self._follower_config({}),
@@ -1909,6 +1969,7 @@ class Station:
         finally:
             follower_cls.send_action = real_send
             follower_cls.get_observation = real_get_obs
+            follower_cls.disconnect = real_disconnect
             follower_cls.configure = real_configure
             with self.lock:
                 self.mode = "idle"
@@ -1974,21 +2035,25 @@ class Station:
             cfg.disable_torque_on_disconnect = False
         return cfg
 
-    def _return_to_start(self, fps: int) -> None:
+    def _return_to_start(self, fps: int) -> bool:
         """Glide the follower back to the start position, then let it hold there.
 
         The same slow, eased walk as the opening sync -- that function walks the
-        follower to whatever pose it is handed, so it is handed this one.
+        follower to whatever pose it is handed, so it is handed this one. An SO
+        follower is left resting on low power there, through the same connection:
+        connecting again just to do that cost a sag, because LeRobot switches the
+        motors off for a moment on every connect. True if it was left resting.
         """
         pose = self._start_pose()
         if pose is None:
-            return
+            return False
 
         class _StartPosition:
             def get_action(self):
                 return dict(pose)
 
         follower = None
+        resting = False
         self.status["phase"] = "returning"
         try:
             follower = self._make_follower(cameras={})
@@ -2007,17 +2072,22 @@ class Station:
                 if follower is not None:
                     if self._estop.is_set():
                         robots.torque_off(follower)
+                    else:
+                        resting = robots.soft_hold(follower)
                     follower.disconnect()
             except Exception:
                 pass
         if not (self._estop.is_set() or self._cancel.is_set()):
             self._return_leader_to_start(pose, fps)
+        return resting
 
     def _soft_hold_follower(self) -> None:
         """After a try, leave an SO follower resting on low torque where it is.
 
-        record() drops it when it lets go, and a dropped arm folds onto the table
-        between tries. A NexArm is left as it was (robots.soft_hold says why).
+        Only when nothing else got it resting -- record() never connected it, say,
+        and _presync left it holding on full power. Normally record()'s own
+        disconnect does it (see _record_worker). A NexArm is left as it was
+        (robots.soft_hold says why).
         """
         if self.kind is None or self.kind.raw_counts:
             return
@@ -2132,28 +2202,42 @@ class Station:
         """
         try:
             kind = self.kind or robots.NEXARM
-            cut = False
             # Three times each, a NexArm move on its way cannot undo it; and on
             # a LeRobot bus, which has no lock, until one gets through between
             # the worker's own commands (a second at most).
-            live = list(self._live.values())
-            sent = {id(d): 0 for d in live}
-            done_ok = set()
+            live = dict(self._live)                  # role -> its open connection
+            sent = dict.fromkeys(live, 0)
+            off: set[str] = set()
+            closed: set[str] = set()
             deadline = time.monotonic() + 1.0
             while live and time.monotonic() < deadline:
-                for dev in live:
+                for role, dev in live.items():
+                    if role in closed:
+                        continue
                     if robots.torque_off(dev):
-                        done_ok.add(id(dev))
-                    sent[id(dev)] += 1
-                if len(done_ok) == len(live) and min(sent.values()) >= 3:
+                        off.add(role)
+                    elif not robots.is_open(dev):
+                        # The worker closed it -- it is stopping too. If that was
+                        # before every motor had been told, its port is free now:
+                        # use that. Waiting out the second on a closed connection
+                        # left two motors of a simulated SO-101 powered for 1.0 s.
+                        closed.add(role)
+                        port = self.cfg.get(f"{role}_port")
+                        if role not in off and port and robots.release(kind, port, role):
+                            off.add(role)
+                    sent[role] += 1
+                if len(off) == len(live) and all(sent[r] >= 3 or r in closed for r in live):
                     break
                 time.sleep(0.03)
-            cut = bool(done_ok)
-            if not cut:
-                for role in ("follower", "leader"):
-                    port = self.cfg.get(f"{role}_port")
-                    if port and robots.release(kind, port, role):
-                        cut = True
+            cut = bool(off)
+            # Through the ports: whatever was open and not confirmed off -- or,
+            # with nothing open, both arms.
+            for role in ("follower", "leader"):
+                port = self.cfg.get(f"{role}_port")
+                if role in off or (live and role not in live) or not port:
+                    continue
+                if robots.release(kind, port, role):
+                    cut = True
             if cut:
                 self.say("Motors off: the arms are floppy.")
             deadline = time.monotonic() + 10

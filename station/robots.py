@@ -546,6 +546,48 @@ def release(kind: Kind, port: str, role: str = "follower") -> bool:
     return False
 
 
+def is_open(device) -> bool:
+    """Whether a device's connection to its arm is still open. Unknown counts as open."""
+    try:
+        return bool(device.bus.is_connected)
+    except Exception:
+        return True
+
+
+# A Feetech bus loses a status packet now and then -- a loose connector, a long
+# cable, a busy USB hub. LeRobot gives up on the first one: one lost reply ended
+# teleop with "There is no status packet!", stopped a try halfway and lost it,
+# or made a connect fail. Found on a simulated SO-101 bus, October 2026. Every
+# read, write and ping is now asked this many more times first. Asking again
+# is always safe: it is the same request, and a write sets the same value.
+LOST_REPLY_RETRIES = 2
+
+
+def retry_lost_replies() -> None:
+    """Make every Feetech bus in this process ask again before it gives up."""
+    try:
+        from lerobot.motors.feetech import FeetechMotorsBus
+    except Exception:
+        return
+    if getattr(FeetechMotorsBus, "_station_retries", False):
+        return
+
+    def patient(real):
+        def call(self, *args, num_retry=0, **kwargs):
+            return real(self, *args, num_retry=max(num_retry, LOST_REPLY_RETRIES), **kwargs)
+        return call
+
+    for name in ("_read", "_write", "_sync_read"):
+        setattr(FeetechMotorsBus, name, patient(getattr(FeetechMotorsBus, name)))
+    real_ping = FeetechMotorsBus.ping
+
+    def ping(self, motor, num_retry=0, raise_on_error=False):
+        return real_ping(self, motor, max(num_retry, LOST_REPLY_RETRIES), raise_on_error)
+
+    FeetechMotorsBus.ping = ping
+    FeetechMotorsBus._station_retries = True
+
+
 def torque_off(device) -> bool:
     """Every motor of one arm off, now, through the connection already open.
 

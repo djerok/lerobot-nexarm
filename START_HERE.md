@@ -69,6 +69,9 @@ The answer is saved. Next time, `python start.py` goes straight to the page.
 `labels.csv` (column `status`), so the try numbers on the page, on the paper sheet
 and in the dataset always agree: try N is episode N-1. Leave the deleted ones out
 when training, e.g. `--dataset.episodes="[0,1,3]"` with the kept episode numbers.
+A try ended before recording began (Done or Stop while the page still says "Getting
+the robot ready") saves nothing, and the next try gets its number. If it was a job's
+first, the empty folder it left is moved to `datasets/.unsaved/`.
 
 **Cameras never hold anything else up.** The station's own camera readers keep
 running through a recording, and the recording reads their newest picture. A
@@ -76,7 +79,7 @@ camera that is unplugged, freezes or wedges is restarted by itself -- the try
 carries on with that camera's last picture (throw the try away if it froze for
 long) -- and the arms, the buttons and the other camera are not affected.
 
-**An SO-100/101 follower rests on low power.** After moving or a try it stays up
+**An SO-100/101 follower rests on low power.** After moving, a try or a replay it stays up
 by itself on about 30% torque instead of folding onto the table. A NexArm cannot:
 its board has motors on or off, nothing between.
 
@@ -139,7 +142,7 @@ do the fifteen-second wave again. Nothing is broken.
 python station/selftest.py
 ```
 
-Runs 210 checks: detection of every kind of arm, the page, the API, the camera streams, the speed limit,
+Runs 226 checks: detection of every kind of arm, the page, the API, the camera streams, the speed limit,
 the railed-reading guard, and that recordings are not set to upload. It needs the
 cameras but never moves an arm.
 
