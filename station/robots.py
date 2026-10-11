@@ -746,4 +746,4 @@ def ranges_prompt(arm: str) -> str:
     arm = arm or "the arm"
     return (f"Now move every joint of {arm} slowly all the way one way and all the "
             f"way back, one joint at a time. When every joint has been to both ends, "
-            f"press Next.")
+            f"press Next. A joint you skip is allowed its whole range.")

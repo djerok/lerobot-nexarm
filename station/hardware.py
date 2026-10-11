@@ -126,6 +126,52 @@ def reading_is_sane(values) -> bool:
         return False
 
 
+# A joint that moved less than this during "move every joint to both ends" counts
+# as not moved. Encoder jitter alone spreads a still joint over a few counts, and
+# a range that narrow would turn every small movement of the hand into a lurch.
+MIN_SWEEP_COUNTS = 100
+
+
+def _lenient_ranges(real, say):
+    """LeRobot's record_ranges_of_motion, minus its refusal over a still joint.
+
+    LeRobot throws the whole calibration away ("Some motors have the same min and
+    max values") if any joint was not swept. Here such a joint gets the motor's
+    whole range instead. Where it points still lines up with the other arm --
+    that comes from the halfway step -- only the stop short of its own end goes.
+    """
+
+    def record(bus, motors=None, display_values=True):
+        seen = []
+        real_read = bus.sync_read
+
+        def watched(data_name, *args, **kwargs):
+            values = real_read(data_name, *args, **kwargs)
+            if data_name == "Present_Position":
+                seen.append(dict(values))
+            return values
+
+        bus.sync_read = watched
+        try:
+            mins, maxes = real(bus, motors, display_values)
+        except ValueError as exc:
+            if "same min and max" not in str(exc) or not seen:
+                raise
+            mins = {m: min(s[m] for s in seen) for m in seen[0]}
+            maxes = {m: max(s[m] for s in seen) for m in seen[0]}
+        finally:
+            del bus.sync_read            # back to the class's own method
+
+        unswept = [m for m in mins if maxes[m] - mins[m] < MIN_SWEEP_COUNTS]
+        for m in unswept:
+            mins[m], maxes[m] = 0, bus.model_resolution_table[bus.motors[m].model] - 1
+        if unswept:
+            say("Not moved to both ends, so given their whole range: " + ", ".join(unswept))
+        return mins, maxes
+
+    return record
+
+
 class _NoCamera:
     """Stands in for an unplugged camera: never a frame, so its reader keeps looking."""
 
@@ -607,6 +653,7 @@ class Station:
                 if not cap.isOpened():
                     failed.append((name, idx))
                 if cap.isOpened():
+                    detect.apply_camera_settings(cap, self._camera_settings(name))
                     self._caps[name] = cap
                     self.say(f"{name} camera {idx}: {detect.capture_format(cap)}")
                 else:
@@ -655,6 +702,10 @@ class Station:
                                      name=f"cam-{name}", daemon=True)
                 t.start()
                 self._pump_threads.append(t)
+
+    def _camera_settings(self, name: str) -> dict | None:
+        """This slot's fixed exposure/brightness, if nexarm.json gives one."""
+        return (self.cfg.get("camera_settings") or {}).get(name)
 
     def close_cameras(self) -> None:
         # Its own stop signal. This used to share _stop with teleop, so closing
@@ -754,6 +805,8 @@ class Station:
         if stop.is_set():
             new.release()
             return None
+        # Replugging resets the camera to auto exposure, so this goes back on.
+        detect.apply_camera_settings(new, self._camera_settings(name))
         self._caps[name] = new
         return new
 
@@ -981,7 +1034,10 @@ class Station:
         """
         import sys
 
+        from lerobot.motors.motors_bus import SerialMotorsBus
+
         real_input = builtins.input
+        real_ranges = SerialMotorsBus.record_ranges_of_motion
         # Every motor bus module that polls the keyboard holds its own reference
         # to enter_pressed: the shared MotorsBus, and a few buses (Damiao,
         # Robstride) that carry their own copy of the range-recording loop.
@@ -1007,12 +1063,14 @@ class Station:
         builtins.input = page_input
         for m, _ in real_enters:
             m.enter_pressed = page_enter
+        SerialMotorsBus.record_ranges_of_motion = _lenient_ranges(real_ranges, self.say)
         try:
             yield
         finally:
             builtins.input = real_input
             for m, fn in real_enters:
                 m.enter_pressed = fn
+            SerialMotorsBus.record_ranges_of_motion = real_ranges
             self.prompt = None
 
     # A Next that arrives sooner than this after a question appeared is ignored.

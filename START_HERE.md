@@ -21,11 +21,57 @@ chip and by talking to the motors (it never moves them to find out). If it guess
 wrong, pick the robot from the list on the first screen.
 
 **The first time a non-NexArm arm is used on a computer**, LeRobot needs to
-calibrate it. The page walks through it with a **Next** button: hold the arm (its
-motors are off), put every joint about halfway, press Next, then move every joint
-to both ends and press Next. That is saved, and never asked again on that computer.
-SO arms are remembered by their USB adapter's serial number, so moving a cable to
-another socket does not mean doing the wave again.
+calibrate it. The page walks through it with a **Next** button -- see
+[NexArm or SO-101](#nexarm-or-so-101) below. That is saved, and never asked again
+on that computer. SO arms are remembered by their USB adapter's serial number, so
+moving a cable to another socket does not mean doing the wave again.
+
+## NexArm or SO-101
+
+Both run from the same `python start.py` and the same page. Only the first time
+is different. The page header says which one it found, e.g.
+`SO-100 / SO-101: leader COM12 - follower COM11`. A NexArm sits behind a CH340
+USB chip with no serial number; an SO arm's board is a CH343 with one.
+
+### NexArm
+
+1. Plug both arms in and switch both on.
+2. Run `python start.py`.
+3. Wave the arm you hold for fifteen seconds (see [The first time](#the-first-time)).
+4. Press **Start moving**. That is all -- a NexArm needs no calibration.
+
+### SO-100 / SO-101
+
+1. Plug both arms in and switch both on.
+2. Run `python start.py`.
+3. Wave the arm you hold for fifteen seconds. The one you wave is the leader; the
+   other is the robot arm (the follower).
+4. Press **Start moving**. The first time these two arms are used on a computer,
+   the page sets them up with four presses of **Next**, robot arm first:
+
+| Step | Which arm | What to do |
+|---|---|---|
+| 1 | the robot arm (follower) | Its motors are off, so hold it up. Put every joint about halfway. Next. |
+| 2 | the robot arm | Move each joint all the way one way and back, one at a time. Next. *Can be skipped.* |
+| 3 | the arm you hold (leader) | The same halfway pose as the robot arm. Next. |
+| 4 | the arm you hold | Move each joint to both ends. Next. *Can be skipped.* |
+
+Then the robot glides over to match the arm in your hand and follows it.
+
+- **Steps 1 and 3 are what line the two arms up.** Do step 1 on the robot arm,
+  not the one in your hand, and put both arms in the same halfway pose. If step 1
+  is done on the wrong arm, the robot arm swings off somewhere else when it starts.
+- **Steps 2 and 4 can be skipped.** A joint not taken to both ends is given the
+  motor's whole range, and the page lists which joints that happened to. The arms
+  line up exactly the same; what is lost is the stop just short of that joint's own
+  end, so take more care near the ends.
+- **Do not press Stop between steps.** It throws away the setup so far.
+- **Where it is saved:** one file per arm, named by its USB adapter's serial
+  number, in `~/.cache/huggingface/lerobot/calibration/`:
+  `robots/so_follower/so101_follower_<serial>.json` and
+  `teleoperators/so_leader/so101_leader_<serial>.json`. To redo the setup, delete
+  those two files. To use a setup from another computer, copy them over with the
+  same names.
 
 ## The first time
 
@@ -120,6 +166,20 @@ stiff after that, use the power switch.
 **If a cable moves to a different USB socket**, the page notices and asks you to
 do the fifteen-second wave again. Nothing is broken.
 
+**`nexarm.json` is this computer's setup, and stays on it.** The page writes it:
+which robot, which port is which arm, which camera is which, the start position.
+It is in `.gitignore` because none of that is true on another computer. One thing
+in it is worth setting by hand -- a camera whose picture has rolling bands under
+the room lights:
+
+```
+"camera_settings": {"wrist": {"exposure": -6, "brightness": -60}}
+```
+
+A fixed exposure of at least one flicker of the lights evens the bands out, and
+brightness pulls the picture back down. A camera with no entry is left on auto.
+Restart `python start.py` after changing it.
+
 ## When something will not work
 
 | What you see | What it means |
@@ -128,6 +188,9 @@ do the fifteen-second wave again. Nothing is broken.
 | `Could not tell them apart` | Two arms moved, or neither did. Wave one, further. |
 | `COM7 is gone -- a cable moved` | Correct, and it is about to ask you to redo the wave. |
 | No picture | No camera plugged in. The arms still work without one. |
+| `Not moved to both ends, so given their whole range: ...` | Normal if those joints were skipped in SO setup step 2 or 4. |
+| SO robot arm swings somewhere else when it starts | Setup step 1 was done on the arm in your hand, or the two arms were not in the same pose for steps 1 and 3. EMERGENCY STOP, delete the two calibration files, start again. |
+| **Save this spot as the start** says *press Start moving first* | The robot is not following yet -- usually an SO setup is still waiting on **Next** at the top of the page. |
 | `Something needed is not installed` | Run `setup.ps1` first. |
 
 ## Checking the software without the robot
@@ -136,7 +199,7 @@ do the fifteen-second wave again. Nothing is broken.
 python station/selftest.py
 ```
 
-Runs 210 checks: detection of every kind of arm, the page, the API, the camera streams, the speed limit,
+Runs 219 checks: detection of every kind of arm, the page, the API, the camera streams, the speed limit,
 the railed-reading guard, and that recordings are not set to upload. It needs the
 cameras but never moves an arm.
 

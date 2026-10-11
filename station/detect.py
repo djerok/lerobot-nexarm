@@ -54,18 +54,51 @@ def open_capture(index: int):
     OpenCV's default on Windows is raw YUY2: about 150 Mbit/s per camera at
     640x480, 30 fps. Two cameras on one USB hub, beside the arms' adapters, ran
     out of bandwidth -- frames dropped, cameras froze and dropped off the bus.
-    MJPG is about a tenth of that. The format must be set before the size, and
-    a camera that cannot do MJPG just stays as it was.
+    MJPG is about a tenth of that. A camera that cannot do MJPG just stays as
+    it was.
+
+    Order matters under DirectShow: setting the FPS last silently resets the
+    format back to YUY2, and on some cameras (icspring 32e6:9221) MJPG only
+    sticks when it is asked for again after the size. So: FPS first, then the
+    format on both sides of the size.
     """
     import cv2
 
     cap = cv2.VideoCapture(int(index), camera_backend())
     if cap.isOpened():
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        mjpg = cv2.VideoWriter_fourcc(*"MJPG")
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_FOURCC, mjpg)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_FOURCC, mjpg)
     return cap
+
+
+def apply_camera_settings(cap, settings: dict | None) -> None:
+    """Fixed exposure / brightness for one camera, from nexarm.json "camera_settings".
+
+    For rolling bands under mains lighting. On auto, a camera looking at a bright
+    white table picks an exposure shorter than one flicker of the lights (8.3 ms
+    at 60 Hz) and each band of rows catches a different part of the flicker.
+    A fixed exposure of at least one flicker (-6, about 1/64 s under DirectShow)
+    evens it out; brightness then pulls the picture back down. The icspring
+    wrist camera has no gain control, and its anti-flicker (power line) setting
+    does nothing while exposure is on auto, so this is the only cure there.
+
+        "camera_settings": {"wrist": {"exposure": -6, "brightness": -60}}
+
+    A camera with no entry is left exactly as it is.
+    """
+    import cv2
+
+    if not settings or not cap.isOpened():
+        return
+    if "exposure" in settings:
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)      # 0.25 = manual under DirectShow
+        cap.set(cv2.CAP_PROP_EXPOSURE, float(settings["exposure"]))
+    if "brightness" in settings:
+        cap.set(cv2.CAP_PROP_BRIGHTNESS, float(settings["brightness"]))
 
 
 def capture_format(cap) -> str:

@@ -816,6 +816,41 @@ def any_kind_of_arm(st_cfg: dict) -> None:
     check("the terminal prompt is put back afterwards",
           builtins.input is real_input and cal.prompt is None)
 
+    # -- a joint nobody swept gets its whole range, instead of failing calibration
+    import types
+
+    class _SweepBus:
+        motors = {m: types.SimpleNamespace(model="sts3215")
+                  for m in ("elbow_flex", "wrist_flex", "gripper")}
+        model_resolution_table = {"sts3215": 4096}
+
+        def __init__(self):
+            self.frames = iter([
+                {"elbow_flex": 2047, "wrist_flex": 2046, "gripper": 2047},
+                {"elbow_flex": 2047, "wrist_flex": 2049, "gripper": 1400},
+                {"elbow_flex": 2047, "wrist_flex": 2047, "gripper": 2900}])
+
+        def sync_read(self, data_name, motors=None, normalize=True):
+            return next(self.frames)
+
+    def upstream(bus, motors=None, display_values=True):
+        for _ in range(3):
+            bus.sync_read("Present_Position", motors, normalize=False)
+        raise ValueError("Some motors have the same min and max values:\n['elbow_flex']")
+
+    said, sbus = [], _SweepBus()
+    lo, hi = hardware._lenient_ranges(upstream, said.append)(sbus)
+    check("a joint left still gets its whole range, not a failed calibration",
+          (lo["elbow_flex"], hi["elbow_flex"]) == (0, 4095), f"{lo} {hi}")
+    check("...so does one that only twitched",
+          (lo["wrist_flex"], hi["wrist_flex"]) == (0, 4095), f"{lo} {hi}")
+    check("...while a swept joint keeps the range it was swept through",
+          (lo["gripper"], hi["gripper"]) == (1400, 2900), f"{lo} {hi}")
+    check("...and the page says which joints",
+          bool(said) and "elbow_flex" in said[0] and "gripper" not in said[0], str(said))
+    check("the bus reads positions the normal way again afterwards",
+          "sync_read" not in vars(sbus))
+
     stopper, out = Station(), []
 
     def waits_forever():
