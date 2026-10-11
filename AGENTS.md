@@ -84,6 +84,7 @@ SETUP.md ("Troubleshooting"), including the CH340 driver.
 | `station/ui.html` | The page |
 | `station/release.py` | Switches the motors off |
 | `station/selftest.py` | Checks that never move an arm |
+| `station/simtest.py` | The SO-100/101 path end to end on simulated arms (`station/feetech_sim.py`) |
 
 After any change, run the checks with the station's own Python and keep them at
 `0 failed`:
@@ -95,6 +96,9 @@ After any change, run the checks with the station's own Python and keep them at
 ```
 ./.venv/bin/python station/selftest.py
 ```
+
+After a change to teleop, recording, replay, the start position or EMERGENCY STOP,
+also run `station/simtest.py` the same way (about five minutes, nothing plugged in).
 
 Safety rules in `station/hardware.py` are deliberate: railed readings (0 or 4095) are
 dropped, targets are capped per tick, the opening sync is gentle, the follower's current

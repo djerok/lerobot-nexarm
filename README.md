@@ -10,7 +10,8 @@ name or a camera number.
 
 **Tested on real arms so far: NexArm only.** The SO-100/101, Koch and
 OpenManipulator-X paths pass the software checks, but none of them has been run on
-real arms yet.
+real arms yet. The SO-100/101 path has also been run end to end on simulated arms
+(`station/simtest.py`).
 
 **Follow the steps below in order. Nothing else in this repository needs to be
 installed, configured or run.**

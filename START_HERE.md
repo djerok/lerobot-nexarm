@@ -146,6 +146,15 @@ Runs 226 checks: detection of every kind of arm, the page, the API, the camera s
 the railed-reading guard, and that recordings are not set to upload. It needs the
 cameras but never moves an arm.
 
+```
+python station/simtest.py
+```
+
+Runs the whole SO-100/101 path on two simulated arms: finding them, the wave test,
+calibration, moving, the gripper, recording, replay, EMERGENCY STOP, a lost reply,
+a moved cable. About five minutes. It needs nothing plugged in and touches no real
+port, camera, calibration or recording.
+
 ## What is in here
 
 | File | Does what |
@@ -158,6 +167,8 @@ cameras but never moves an arm.
 | `station/ui.html` | The page. |
 | `station/release.py` | Switches the motors off. |
 | `station/selftest.py` | The checks above. |
+| `station/simtest.py` | The SO-100/101 path on simulated arms. |
+| `station/feetech_sim.py` | The simulated arms: two SO-101 motor buses, byte for byte. |
 
 The older command-line tools still work and are unchanged:
 `nexarm.py`, `nexarm_autoconfig.py`, `teleop_nocam.py`, `probe_arms.py`.

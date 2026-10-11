@@ -310,6 +310,19 @@ moves an arm.
 Camera checks are skipped, with a note, when the station is already running (it
 holds the cameras) or when no camera is plugged in. Neither is a failure.
 
+```
+python station/simtest.py
+```
+
+The whole SO-100/101 path, end to end, on two simulated SO-101 arms
+(`station/feetech_sim.py`): the real LeRobot and station code, with only the serial
+port, the port list and the cameras replaced. Detection, the wave test, calibration
+on the page, teleop, the gripper guard, the start position, recording, replay,
+EMERGENCY STOP, lost replies, Switch the motors off, a moved cable. About five
+minutes; nothing needs to be plugged in, and no real port, camera, calibration file
+or recording is touched. It cannot know what a real servo does that its manual does
+not say, so it does not replace a run on real arms.
+
 ---
 
 ## 11. The older command-line tools
@@ -343,5 +356,7 @@ the flag yourself.
 | `station/ui.html` | The page. No frameworks, no CDN. |
 | `station/release.py` | Switches the motors off. |
 | `station/selftest.py` | The 226 checks. |
+| `station/simtest.py` | The SO-100/101 path on simulated arms. |
+| `station/feetech_sim.py` | The simulated arms: two SO-101 motor buses, byte for byte. |
 | `nexarm.json` | Which port is which arm, which camera is which. Machine-specific, not committed. |
 | `datasets/` | Your recordings. Not committed. |
