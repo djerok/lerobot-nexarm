@@ -8,10 +8,12 @@ It works with a leader/follower pair of **NexArm**, **SO-100 / SO-101**, **Koch*
 **OpenManipulator-X**. It finds the arms and cameras by itself: you never type a port
 name or a camera number.
 
-**Tested on real arms so far: NexArm only.** The SO-100/101, Koch and
-OpenManipulator-X paths pass the software checks, but none of them has been run on
-real arms yet. The SO-100/101 path has also been run end to end on simulated arms
-(`station/simtest.py`).
+**Tested on real arms so far: NexArm.** An SO-101 pair has been plugged in once:
+it was found and the wave test told the arms apart, but calibration stopped on that
+follower's gripper motor (see `exceeds 2047` in [START_HERE.md](START_HERE.md)), so
+SO-101 teleop and recording are not yet confirmed on real arms. The SO-100/101 path
+runs end to end on simulated arms (`station/simtest.py`). Koch and
+OpenManipulator-X pass the software checks only.
 
 **Follow the steps below in order. Nothing else in this repository needs to be
 installed, configured or run.**

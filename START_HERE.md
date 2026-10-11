@@ -20,8 +20,9 @@ software is installed. The page works out which one is plugged in from the USB
 chip and by talking to the motors (it never moves them to find out). If it guesses
 wrong, pick the robot from the list on the first screen.
 
-Only the NexArm has been run on real arms so far. The others pass the software
-checks but are untested on hardware.
+Only the NexArm has been run fully on real arms so far. An SO-101 pair was found and
+told apart on real arms, but its teleop and recording are not confirmed yet; the
+others pass the software checks only.
 
 **The first time a non-NexArm arm is used on a computer**, LeRobot needs to
 calibrate it. The page walks through it with a **Next** button: hold the arm (its
@@ -135,6 +136,7 @@ do the fifteen-second wave again. Nothing is broken.
 | `COM7 is gone -- a cable moved` | Correct, and it is about to ask you to redo the wave. |
 | No picture | No camera plugged in. The arms still work without one. |
 | `Something needed is not installed` | Run the setup script first: `setup.ps1` on Windows, `bash setup.sh` on macOS. |
+| `exceeds 2047` or `Negative values are not allowed` while calibrating | A joint's motor counts on past one full turn, because that joint's travel crosses the motor's zero (seen on an SO-101 gripper). Switch that arm off and on and calibrate again. If it happens again, re-centre that motor: take its horn off, set the motor to its middle (Feetech's software, or Seeed's SO-ARM tool), and put the joint back on at the middle of its travel. |
 
 ## Checking the software without the robot
 

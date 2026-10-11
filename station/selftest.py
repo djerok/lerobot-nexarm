@@ -1160,6 +1160,20 @@ def any_kind_of_arm(st_cfg: dict) -> None:
     check("...so two lost replies in a row still get the reading",
           got == 2048 and lossy.packet_handler.calls == 3, str(got))
 
+    # -- a real STS3215 applies a new Homing_Offset a few ms late: calibration waits for it
+    settling = FeetechMotorsBus("COM98", {"m": Motor(6, "sts3215", MotorNormMode.RANGE_0_100)})
+    wrote = []
+    settling.write = lambda name, motor, value, **kw: wrote.append(name)
+    t0 = time.perf_counter()
+    settling.reset_calibration()
+    took = time.perf_counter() - t0
+    check("after LeRobot resets a calibration, nothing reads positions for a moment",
+          took >= robots.CALIBRATION_SETTLE_S * 0.9 and "Homing_Offset" in wrote, f"{took:.2f} s")
+    check("a motor counting past one turn gets words a person can act on",
+          "Switch that arm off and on" in robots.plain_error(
+              ValueError("Magnitude 2870 exceeds 2047 (max for sign_bit_index=11)"))
+          and robots.plain_error(OSError("x")) == "OSError: x")
+
     # -- a job whose first try never got saved can still be recorded
     with tempfile.TemporaryDirectory() as tmp:
         ds = Station()

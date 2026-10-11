@@ -588,6 +588,54 @@ def retry_lost_replies() -> None:
     FeetechMotorsBus._station_retries = True
 
 
+# An STS3215 applies a new Homing_Offset a few milliseconds after it has said
+# yes to it. LeRobot's calibration resets every offset to 0 and reads the
+# positions straight away, to centre each joint on them -- and on the first real
+# SO-101 the last joint written, the gripper, still read 4917 under its old
+# offset (3985 under the new one 5 ms later). The offset worked out from that,
+# 2870, does not fit the register, and calibration died with "Magnitude 2870
+# exceeds 2047". Writing a saved calibration has the same gap, and a position
+# read inside it would be parked as the goal under the wrong offset. Both wait.
+CALIBRATION_SETTLE_S = 0.2
+
+
+def settle_after_calibration_writes() -> None:
+    """Make every Feetech bus wait after LeRobot resets or writes a calibration."""
+    try:
+        from lerobot.motors.feetech import FeetechMotorsBus
+    except Exception:
+        return
+    if getattr(FeetechMotorsBus, "_station_settles", False):
+        return
+    for name in ("reset_calibration", "write_calibration"):
+        def settled(self, *args, _real=getattr(FeetechMotorsBus, name), **kwargs):
+            out = _real(self, *args, **kwargs)
+            time.sleep(CALIBRATION_SETTLE_S)
+            return out
+
+        setattr(FeetechMotorsBus, name, settled)
+    FeetechMotorsBus._station_settles = True
+
+
+def plain_error(exc: Exception) -> str:
+    """An error for the page: LeRobot's words, plus what to do about the ones a person can fix.
+
+    The first real SO-101 follower failed calibration with "Magnitude 2870 exceeds
+    2047": its gripper motor counts on past one full turn (it read 4058 -> 5105 with
+    no offset at all), because the jaw's travel crosses the motor's zero. LeRobot's
+    homing cannot express a position past one turn, and a range that crosses zero
+    after a restart gives "Negative values are not allowed".
+    """
+    text = f"{type(exc).__name__}: {exc}"
+    msg = str(exc)
+    if isinstance(exc, ValueError) and ("exceeds 2047" in msg or "Negative values are not allowed" in msg):
+        return (text + " -- calibration could not finish: a joint of this arm reads past one full "
+                "turn of its motor, because its travel crosses the motor's zero. Switch that arm "
+                "off and on, then calibrate again. If it happens again, that motor needs "
+                "re-centring (see START_HERE.md, When something will not work).")
+    return text
+
+
 def torque_off(device) -> bool:
     """Every motor of one arm off, now, through the connection already open.
 

@@ -328,6 +328,7 @@ class Station:
         self._calibrating = ""
 
         robots.retry_lost_replies()
+        robots.settle_after_calibration_writes()
 
     @property
     def kind(self) -> robots.Kind | None:
@@ -940,7 +941,7 @@ class Station:
         except robots.Cancelled:
             self.say("Stopped before the arms were ready.")
         except Exception as exc:
-            self.error = f"{type(exc).__name__}: {exc}"
+            self.error = robots.plain_error(exc)
             self.say(f"Teleop stopped with an error: {self.error}")
             traceback.print_exc()
         finally:
@@ -1721,7 +1722,7 @@ class Station:
                 # ready: lerobot refuses to save a try with nothing in it.
                 self.say("The try ended before recording began, so there was nothing to save.")
             else:
-                self.error = f"{type(exc).__name__}: {exc}"
+                self.error = robots.plain_error(exc)
                 self.say(f"Recording stopped with an error: {self.error}")
                 traceback.print_exc()
         finally:
@@ -1963,7 +1964,7 @@ class Station:
         except (KeyboardInterrupt, robots.Cancelled):
             self.say("Replay stopped.")
         except Exception as exc:
-            self.error = f"{type(exc).__name__}: {exc}"
+            self.error = robots.plain_error(exc)
             self.say(f"Replay stopped with an error: {self.error}")
             traceback.print_exc()
         finally:
