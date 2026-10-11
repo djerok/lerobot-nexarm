@@ -47,7 +47,33 @@
   .mode.teleop { background: #17402c; color: var(--go-hi); }
   .mode.record { background: #43201e; color: var(--rec-hi); }
   .mode.replay { background: #1e3350; color: #8ab6f0; }
-  main { padding: 22px 26px 40px; max-width: 1180px; }
+  .layout { display: flex; align-items: flex-start; gap: 22px; padding: 22px 26px 40px; }
+  main { flex: 1 1 auto; min-width: 0; max-width: 1180px; }
+  /* The pictures stay on screen wherever the page is scrolled, as the EMERGENCY
+     STOP does: a column of their own that sticks under the header, sized so that
+     both pictures fit the window's height. --headH is the header's real height,
+     which changes when it wraps. */
+  #camSide {
+    flex: 0 0 auto; position: sticky; top: calc(var(--headH, 120px) + 14px);
+    width: max(260px, min(34vw, calc((100vh - var(--headH, 120px) - 130px) / 2 * 4 / 3)));
+    background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 12px;
+  }
+  #camSide h2 { font-size: 17px; margin: 0 0 8px; }
+  #camSide .cams { flex-direction: column; gap: 10px; flex-wrap: nowrap; }
+  #camSide figure img { width: 100%; }
+  #camSide figcaption { margin-top: 4px; font-size: 13px; }
+  /* A narrow window has no room for a column: the pictures become a strip that
+     sticks under the header instead, side by side and short, so that they never
+     cover a button. */
+  @media (max-width: 980px) {
+    .layout { flex-direction: column; align-items: stretch; }
+    main { max-width: none; }
+    #camSide { order: -1; width: auto; top: var(--headH, 120px); z-index: 9; padding: 8px; }
+    #camSide h2 { display: none; }
+    #camSide .cams { flex-direction: row; }
+    #camSide figure { flex: 1 1 0; min-width: 0; }
+    #camSide figure img { max-height: 24vh; object-fit: contain; }
+  }
   .card {
     background: var(--card); border: 1px solid var(--line);
     border-radius: 14px; padding: 22px; margin-bottom: 20px;
@@ -123,6 +149,7 @@
   <button class="estop" id="estopBtn" onclick="estop()">EMERGENCY STOP</button>
 </header>
 
+<div class="layout">
 <main>
   <div id="err" class="err hide"></div>
   <div id="estopNote" class="estopNote hide"></div>
@@ -155,10 +182,9 @@
     </div>
   </section>
 
-  <!-- 2. Cameras -->
+  <!-- 2. Cameras: the pictures themselves are in the column at the side -->
   <section id="camCard" class="card hide">
-    <h2>What the robot sees</h2>
-    <div class="cams" id="cams"></div>
+    <h2>Pick the cameras</h2>
     <p>
       <label><span>Front camera</span><select id="camFront" onchange="setCams()"></select></label>
       <label><span>Wrist camera</span><select id="camWrist" onchange="setCams()"></select></label>
@@ -246,7 +272,8 @@
     <p>
       <label><span>Which recording</span>
         <select id="dsPick" onchange="fillEpisodes()"></select></label>
-      <label><span>Which try</span><input type="number" id="dsEp" value="0" min="0"></label>
+      <label><span>Which try</span><input type="number" id="dsEp" value="1" min="1"
+             oninput="epTouched = true"></label>
     </p>
     <button class="big" id="replayBtn" onclick="startReplay()">Play it back</button>
     <p class="dim" id="replayNote"></p>
@@ -272,6 +299,13 @@
     <pre id="log"></pre>
   </section>
 </main>
+
+<!-- Always on screen, like the EMERGENCY STOP (see #camSide in the style). -->
+<aside id="camSide" class="hide">
+  <h2>What the robot sees</h2>
+  <div class="cams" id="cams"></div>
+</aside>
+</div>
 <div id="toast" class="toast hide"></div>
 
 <script>
@@ -280,6 +314,19 @@ let dragging = false;
 let streamsFor = "";
 let datasetsKey = "";
 let dirTouched = false;
+let epTouched = false;       // someone typed a try number to replay
+
+// The camera column sticks just under the header, whose height changes: when
+// it wraps onto two lines, and when the port names fill in after the first
+// poll. Watching the header itself catches both; a window resize alone did not,
+// and the pictures ended up tucked under it.
+function fitHeader() {
+  document.documentElement.style.setProperty(
+    "--headH", document.querySelector("header").offsetHeight + "px");
+}
+if (window.ResizeObserver) new ResizeObserver(fitHeader).observe(document.querySelector("header"));
+window.addEventListener("resize", fitHeader);
+fitHeader();
 let refind = false;          // set-up shown again on request, even with a working setup
 
 const $ = id => document.getElementById(id);
@@ -369,20 +416,33 @@ async function pollDetect() {
 
 function setDir() { post("/api/datasets/dir", {path: $("dsdir").value}); }
 
+// Tries are counted from 1 here, as everywhere else on the page and on the
+// paper sheet ("Try 3"). This box used to count from 0, so typing the number
+// the page had just shown asked for a try that did not exist yet.
 function fillEpisodes() {
   const d = (state.datasets || []).find(x => x.name === $("dsPick").value);
   const n = d ? d.episodes : 0;
-  $("dsEp").max = Math.max(0, n - 1);
+  $("dsEp").max = Math.max(1, n);
+  const now = +$("dsEp").value;
+  // The newest try, unless someone is choosing one.
+  if (n && (!epTouched || now < 1 || now > n) && document.activeElement !== $("dsEp")) {
+    $("dsEp").value = n;
+  }
   $("replayNote").textContent = d
-    ? `${d.name} has ${n} ${n === 1 ? "try" : "tries"}, numbered 0 to ${Math.max(0, n - 1)}.`
+    ? `${d.name} has ${n} ${n === 1 ? "try" : "tries"}: try 1 to try ${n}, the same numbers as on the page.`
     : "";
 }
 
 function startReplay() {
   const name = $("dsPick").value;
   if (!name) { toast("Record something first."); return; }
-  if (!confirm("The arm will move on its own. Is everyone clear of it?")) return;
-  post("/api/replay/start", {name: name, episode: +$("dsEp").value});
+  const d = (state.datasets || []).find(x => x.name === name);
+  const n = d ? d.episodes : 0;
+  const tryNo = Math.round(+$("dsEp").value);
+  if (!(tryNo >= 1 && tryNo <= n)) { toast(`Pick a try from 1 to ${n}.`); return; }
+  if (!confirm(`The arm will play try ${tryNo} back on its own. Is everyone clear of it?`)) return;
+  epTouched = false;
+  post("/api/replay/start", {name: name, episode: tryNo - 1});
 }
 
 function buildDatasets(list) {
@@ -501,6 +561,7 @@ async function refresh() {
   const c = s.config || {};
   $("ports").textContent = c.leader_port
     ? `${s.robot ? s.robot.label + ": " : ""}leader ${c.leader_port} - follower ${c.follower_port}` : "";
+  fitHeader();                             // the text above can wrap the header
   buildKinds(s.robots || []);
 
   $("promptCard").classList.toggle("hide", !s.prompt);
@@ -527,6 +588,7 @@ async function refresh() {
   $("setupDrag").classList.toggle("hide", !dragging);
 
   $("camCard").classList.toggle("hide", !ready);
+  $("camSide").classList.toggle("hide", !ready || !(s.cameras || []).length);
   $("driveCard").classList.toggle("hide", !ready);
   $("recCard").classList.toggle("hide", !ready);
   $("replayCard").classList.toggle("hide", !ready);

@@ -20,6 +20,9 @@ software is installed. The page works out which one is plugged in from the USB
 chip and by talking to the motors (it never moves them to find out). If it guesses
 wrong, pick the robot from the list on the first screen.
 
+Only the NexArm has been run on real arms so far. The others pass the software
+checks but are untested on hardware.
+
 **The first time a non-NexArm arm is used on a computer**, LeRobot needs to
 calibrate it. The page walks through it with a **Next** button: hold the arm (its
 motors are off), put every joint about halfway, press Next, then move every joint

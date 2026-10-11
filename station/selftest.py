@@ -286,6 +286,44 @@ def main() -> int:
         check("display_data off so it does not need rerun", cfg.display_data is False)
         check("cameras carried into the robot config",
               set(cfg.robot.cameras) == set(st.cfg["cameras"]))
+        # The first class's front camera lost 3-15% of its frames and the loop
+        # fell to 9-21 Hz, because lerobot's default software AV1 could not keep
+        # up while streaming. Anything but that default is the point here.
+        enc = cfg.dataset.rgb_encoder
+        check("video is encoded with a fast encoder, not the default AV1",
+              (enc.vcodec == "h264" and enc.preset == "veryfast")
+              or enc.vcodec not in ("libsvtav1", "libaom-av1"),
+              f"{enc.vcodec} preset {enc.preset}")
+        check("streaming encoding stays on (Done must not wait for the whole video)",
+              cfg.dataset.streaming_encoding is True)
+        check("encoder queue holds a few seconds, not lerobot's one",
+              cfg.dataset.encoder_queue_maxsize >= 90, str(cfg.dataset.encoder_queue_maxsize))
+
+    print("\n6b. what a try that went wrong says about itself")
+    import logging
+    from station.hardware import _RecordHealth
+
+    def rec(msg):
+        return logging.LogRecord("lerobot.datasets.video_utils", logging.WARNING, "", 0, msg, None, None)
+
+    h = _RecordHealth()
+    # Exactly what lerobot logs, copied from the first class's station.log.
+    h.emit(rec("Encoder queue full for observation.images.front, dropped 10 frame(s). "
+               "Consider using vcodec='auto' for hardware encoding or increasing encoder_queue_maxsize."))
+    h.emit(rec("Episode finished with 54 dropped frame(s) for observation.images.front."))
+    for _ in range(300):
+        h.emit(rec("Record loop is running slower (18.4 Hz) than the target FPS (30 Hz). "
+                   "Dataset frames might be dropped"))
+    said = h.problems(462)
+    check("dropped frames are counted from the end-of-episode line, not the running one",
+          h.dropped == {"observation.images.front": 54}, str(h.dropped))
+    check("...and named in plain words, with the camera", "front camera lost 54 of 462" in said, said)
+    check("a slow loop for most of the try is reported", "could not keep up for 64%" in said, said)
+    clean = _RecordHealth()
+    for _ in range(5):
+        clean.emit(rec("Record loop is running slower (29.1 Hz) than the target FPS (30 Hz)."))
+    check("a clean try says nothing (a few slow ticks are normal)", clean.problems(462) == "",
+          clean.problems(462))
 
     print("\n7. keyboard patch shape")
     try:
@@ -362,6 +400,18 @@ def main() -> int:
 
         check("replay refuses a name that is not there",
               ds.start_replay("no_such_thing", 0).get("ok") is False)
+        # The first class typed "3" for the try the page had just called Try 3,
+        # and lerobot answered "Instruction 'train' corresponds to no data!".
+        real_usable = ds.usable
+        ds.usable = lambda: (True, "")              # past the arms, to the range check itself
+        try:
+            why = ds.start_replay("nexarm_fake", 3).get("why", "")
+            check("replay of a try that does not exist names the tries that do, in page numbers",
+                  "Pick a try from 1 to 3" in why, why)
+            why = ds.start_replay("nexarm_fake", -1).get("why", "")
+            check("...and so does a negative one", "Pick a try from 1 to 3" in why, why)
+        finally:
+            ds.usable = real_usable
         ds.mode = "record"
         check("replay refuses while something else runs",
               ds.start_replay("nexarm_fake", 0).get("ok") is False)

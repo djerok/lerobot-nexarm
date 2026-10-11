@@ -32,7 +32,9 @@ import builtins
 import contextlib
 import csv
 import json
+import logging
 import math
+import re
 import threading
 import time
 import traceback
@@ -43,6 +45,52 @@ from . import detect, robots
 
 ROOT = Path(__file__).resolve().parent.parent
 DATASETS_DIR = ROOT / "datasets"
+
+
+class _RecordHealth(logging.Handler):
+    """What lerobot says, while one try records, about the try going wrong.
+
+    Two things it only ever logs, and that ruin a try without stopping it: video
+    frames its encoder dropped because its queue was full, and record-loop ticks
+    that took longer than one frame. Every frame is still stamped 1/fps apart,
+    so slow ticks make the try play back faster than it was done, and a dropped
+    frame shifts every later picture against the arm data. Both happened to most
+    tries of the first class, and nobody could see it.
+    """
+
+    DROPPED = re.compile(r"Episode finished with (\d+) dropped frame\(s\) for (\S+?)\.?$")
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.dropped: dict[str, int] = {}
+        self.slow_ticks = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return
+        m = self.DROPPED.search(msg)
+        if m:
+            key = m.group(2)
+            self.dropped[key] = self.dropped.get(key, 0) + int(m.group(1))
+        elif msg.startswith("Record loop is running slower"):
+            self.slow_ticks += 1
+
+    def problems(self, frames: int) -> str:
+        """Plain words for whatever went wrong, or "" for a clean try."""
+        out = []
+        for key, n in sorted(self.dropped.items()):
+            if n:
+                cam = key.rsplit(".", 1)[-1]
+                out.append(f"the {cam} camera lost {n} of {frames} pictures, so its video "
+                           f"no longer lines up with the arm")
+        # A few slow ticks are normal (the first frames, a busy moment). A tenth
+        # of the try is not: the try is then visibly faster than it was done.
+        if frames and self.slow_ticks > frames / 10:
+            out.append(f"the computer could not keep up for {100 * self.slow_ticks // frames}% of "
+                       f"the try, so it plays back faster than it was done")
+        return "; ".join(out)
 
 # --- Speed -------------------------------------------------------------------
 #
@@ -607,6 +655,7 @@ class Station:
                 if not cap.isOpened():
                     failed.append((name, idx))
                 if cap.isOpened():
+                    detect.apply_camera_settings(cap, self._camera_settings(name))
                     self._caps[name] = cap
                     self.say(f"{name} camera {idx}: {detect.capture_format(cap)}")
                 else:
@@ -655,6 +704,10 @@ class Station:
                                      name=f"cam-{name}", daemon=True)
                 t.start()
                 self._pump_threads.append(t)
+
+    def _camera_settings(self, name: str) -> dict | None:
+        """This slot's fixed exposure/brightness, if nexarm.json gives one."""
+        return (self.cfg.get("camera_settings") or {}).get(name)
 
     def close_cameras(self) -> None:
         # Its own stop signal. This used to share _stop with teleop, so closing
@@ -754,6 +807,8 @@ class Station:
         if stop.is_set():
             new.release()
             return None
+        # Replugging resets the camera to auto exposure, so this goes back on.
+        detect.apply_camera_settings(new, self._camera_settings(name))
         self._caps[name] = new
         return new
 
@@ -1399,6 +1454,26 @@ class Station:
             ).start()
             return {"ok": True}
 
+    @staticmethod
+    def _video_encoder():
+        """The fastest video encoder this machine's PyAV has, as lerobot config.
+
+        H.264 veryfast where it exists (see record_config for why not AV1). A PyAV
+        build without it -- possible on some Macs -- would make lerobot refuse the
+        config and so every recording, so this falls back to whatever hardware
+        encoder lerobot finds (VideoToolbox, NVENC, Quick Sync), and only then to
+        lerobot's own default.
+        """
+        from lerobot.configs.video import RGBEncoderConfig
+
+        for kwargs in ({"vcodec": "h264", "preset": "veryfast", "crf": 23, "g": 2},
+                       {"vcodec": "auto", "g": 2}):
+            try:
+                return RGBEncoderConfig(**kwargs)
+            except ValueError:
+                continue
+        return RGBEncoderConfig()
+
     def record_config(self, task: str):
         """Exactly what is handed to lerobot's record() for one try of ``task``.
 
@@ -1449,6 +1524,23 @@ class Station:
                 # the robot could even start back to the start position.
                 streaming_encoding=True,
                 encoder_threads=2,
+                # H.264, not lerobot's default software AV1. Streaming encoding
+                # has to keep up in real time, and AV1 does not on a class laptop:
+                # on the i5-1145G7 that recorded the first class, two AV1 encoders
+                # managed 31 frames a second each with nothing else running. With
+                # the cameras, the arms and the page added, the record loop fell
+                # to 9-21 Hz while every frame was still stamped 1/30 s -- so each
+                # try plays back 1.5-3x faster than it was done -- and lerobot
+                # dropped 3-15% of the front camera's frames when its encoder
+                # queue was full, which shifts every later picture against the
+                # arm data. H.264 veryfast on the same machine: 111 frames a
+                # second per camera, files no bigger, and a replay of the class
+                # load held 30.0 Hz with 900/900 frames kept on both cameras.
+                rgb_encoder=self._video_encoder(),
+                # Three seconds of frames rather than one, for a moment the
+                # machine is busy with something else. Not a cure for an encoder
+                # that is too slow -- that one is above -- only for a hiccup.
+                encoder_queue_maxsize=90,
                 # The dataset is video of the room, and the room has children in
                 # it. lerobot's own default here is True, which would publish it
                 # to a public Hugging Face dataset the moment recording finished.
@@ -1539,6 +1631,7 @@ class Station:
         self._catching_up = False
         self._grip, self._last_obs = {}, None
         go_home = False
+        health = _RecordHealth()
         try:
             # The first time a LeRobot arm is used on this computer it calibrates
             # while connecting, here or in record(), and the questions come to
@@ -1561,11 +1654,19 @@ class Station:
                 self.say(f'Getting ready to record "{task}". Hold still a moment.')
                 self.say(f"{'Adding to' if cfg.resume else 'Saving to'} {root} on this computer only.")
                 self._watch_episodes()
-                lr.record(cfg)
+                logging.getLogger().addHandler(health)
+                try:
+                    lr.record(cfg)
+                finally:
+                    logging.getLogger().removeHandler(health)
             if self._episodes_in(root) > try_no:
-                self._write_label(root, try_no, task)
+                problems = health.problems(self._episode_frames(root, try_no))
+                self._write_label(root, try_no, task, problems)
                 self.say(f"Try {try_no + 1} saved, marked DELETED." if self._deleted
                          else f"Try {try_no + 1} saved.")
+                if problems:
+                    self.say(f"Try {try_no + 1} has a problem: {problems}. "
+                             f"It is noted in labels.csv. Do it again if you can.")
             else:
                 self.say("This try was not saved.")
             go_home = not self._cancel.is_set()
@@ -1598,6 +1699,21 @@ class Station:
     # ----------------------------------------------------------------- labels
 
     @staticmethod
+    def _episode_frames(root: Path, episode: int) -> int:
+        """How many frames one saved episode holds, from the dataset's own metadata."""
+        try:
+            import pyarrow.parquet as pq
+
+            for f in sorted((root / "meta" / "episodes").rglob("*.parquet"), reverse=True):
+                t = pq.read_table(f, columns=["episode_index", "length"]).to_pydict()
+                for i, n in zip(t["episode_index"], t["length"]):
+                    if int(i) == episode:
+                        return int(n)
+        except Exception:
+            pass
+        return 0
+
+    @staticmethod
     def _episodes_in(root: Path) -> int:
         """How many tries a job's dataset holds: the number the next one gets."""
         try:
@@ -1612,19 +1728,21 @@ class Station:
                 self.labels[k] = str(body.get(k) or "").strip()[:200]
         return {"ok": True, "labels": self.labels}
 
-    def _write_label(self, root: Path, try_no: int, task: str) -> None:
+    def _write_label(self, root: Path, try_no: int, task: str, problems: str = "") -> None:
         """One line per try in <job>/labels.csv -- kept and deleted tries alike.
 
         The try number is the one the page shows and the sheet gets: the dataset's
         episode number plus one, so children count from 1. Both are written. Deleted tries stay in the dataset;
-        leave them out when training by this file's status column.
+        leave them out when training by this file's status column. Anything the
+        station saw go wrong with the recording itself is added to the notes.
         """
         path = root / "labels.csv"
         lab = self.labels
+        notes = " | ".join(n for n in (lab["notes"], f"station: {problems}" if problems else "") if n)
         row = {"try": try_no + 1, "episode": try_no, "status": "deleted" if self._deleted else "kept", "job": task,
                "driver": lab["driver"], "recorder": lab["recorder"], "labeler": lab["labeler"],
                "position": lab["position"], "something_wrong": lab["wrong"],
-               "type": lab["type"], "notes": lab["notes"],
+               "type": lab["type"], "notes": notes,
                "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}
         try:
             new = not path.is_file()
@@ -1678,6 +1796,14 @@ class Station:
             root = self.datasets_dir() / name
             if not (root / "meta" / "info.json").is_file():
                 return {"ok": False, "why": f"no recording called {name}"}
+            # Checked here, in the page's own numbering, because lerobot's answer
+            # to an episode that does not exist is "Instruction 'train'
+            # corresponds to no data!" -- which is what the first class got,
+            # twice, after typing the try number the page had just shown them.
+            tries = self._episodes_in(root)
+            if not 0 <= episode < tries:
+                return {"ok": False, "why": f"{name} has {tries} {'try' if tries == 1 else 'tries'}. "
+                                            f"Pick a try from 1 to {tries}."}
             refused = self._clear_estop()
             if refused:
                 return refused
@@ -1688,7 +1814,7 @@ class Station:
             self.error = None
             self.mode = "replay"
             self._cancel.clear()
-            self.status.update(phase=f"replaying {name} episode {episode}")
+            self.status.update(phase=f"replaying {name} try {episode + 1}")
             threading.Thread(target=self._replay_worker, args=(name, episode),
                              name="replay", daemon=True).start()
             return {"ok": True}
@@ -1762,7 +1888,7 @@ class Station:
             self._stop.clear()
             follower_cls.send_action = limited_send
             follower_cls.get_observation = keeping_get_obs
-            self.say(f"Replaying {name}, episode {episode}. Keep hands clear.")
+            self.say(f"Replaying {name}, try {episode + 1}. Keep hands clear.")
             cfg = lrp.ReplayConfig(
                 robot=self._follower_config({}),
                 dataset=lrp.DatasetReplayConfig(

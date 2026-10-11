@@ -8,6 +8,10 @@ It works with a leader/follower pair of **NexArm**, **SO-100 / SO-101**, **Koch*
 **OpenManipulator-X**. It finds the arms and cameras by itself: you never type a port
 name or a camera number.
 
+**Tested on real arms so far: NexArm only.** The SO-100/101, Koch and
+OpenManipulator-X paths pass the software checks, but none of them has been run on
+real arms yet.
+
 **Follow the steps below in order. Nothing else in this repository needs to be
 installed, configured or run.**
 
@@ -34,6 +38,10 @@ cd lerobot-nexarm
 
 No `git`? On https://github.com/djerok/lerobot-nexarm click **Code → Download ZIP**,
 unzip it, and open the terminal in the unzipped folder.
+
+Put it in a folder that is **not synced**: not inside OneDrive (which on Windows often
+includes the Desktop), iCloud Drive or Dropbox. Those upload every recording, which is
+video of the room, and the station itself never does.
 
 ## Step 3. Install, once per computer
 
@@ -102,6 +110,9 @@ Press **Start moving**. Move the arm in your hand; the robot follows. If the two
 start in different poses, the robot glides over slowly first, then keeps up at full
 speed. **Stop** ends it.
 
+The camera pictures stay on screen wherever you scroll, like the EMERGENCY STOP: in a
+column on the right, or along the top when the window is narrow.
+
 ## Step 8. Record data
 
 1. In **Teach the robot a job**, type a name under **What is the job?** (for example
@@ -118,7 +129,12 @@ speed. **Stop** ends it.
    same dataset, so a session of tries builds one dataset worth training on. The page
    says **SWAP JOBS** every 10 tries.
 
-**Play it back** replays a saved try on the robot by itself. Keep clear of it.
+**Play it back** replays a saved try on the robot by itself, by the same try number the
+page showed while recording (Try 1, Try 2, ...). Keep clear of it.
+
+If a try records badly (a camera losing pictures, or the computer falling behind so the
+try would play back too fast), the page says so straight after it is saved, and the same
+words go into that try's `notes` in `labels.csv`. Record it again if you can.
 
 **Where recordings go:** `datasets/` in this folder (or a folder you choose on the
 page), one folder per job named after the robot and the job, e.g.
